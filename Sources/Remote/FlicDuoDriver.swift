@@ -96,6 +96,7 @@ public final class FlicDuoDriver: NSObject, ObservableObject {
 
     /// Plays tactile/audible confirmation beeps on the Flic Duo built-in buzzer (firmware >= 20).
     public func playBuzzerFeedback(micEnabled: Bool) {
+        #if !targetEnvironment(simulator)
         guard let button = activeButton, button.isReady, button.isFlicDuo() else { return }
         let notes: [FLICButtonBuzzerNote]
         if micEnabled {
@@ -108,9 +109,11 @@ public final class FlicDuoDriver: NSObject, ObservableObject {
             ]
         }
         button.playBuzzerSound(notes)
+        #endif
     }
 
     public func testBuzzer() {
+        #if !targetEnvironment(simulator)
         guard let button = activeButton, button.isReady, button.isFlicDuo() else {
             emitLog("[Flic] 버저 테스트는 연결된 Flic Duo에서만 동작합니다.")
             return
@@ -121,6 +124,9 @@ public final class FlicDuoDriver: NSObject, ObservableObject {
             FLICButtonBuzzerNote(hz: 2600, duration: 60)
         ])
         emitLog("[Flic] Flic Duo 버저 테스트 재생")
+        #else
+        emitLog("[Flic] 시뮬레이터에서는 버저 테스트를 건너뜁니다.")
+        #endif
     }
 
     // MARK: - Internal Binding & Gesture Mapping
