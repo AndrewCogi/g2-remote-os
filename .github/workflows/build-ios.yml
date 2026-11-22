@@ -1,0 +1,79 @@
+name: Build iOS IPA (SideStore)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify protocol golden vectors & config
+        run: python3 scripts/verify_protocol.py
+
+      - name: Select latest Xcode
+        run: |
+          XCODE_APP=$(ls -d /Applications/Xcode_*.app /Applications/Xcode.app 2>/dev/null | sort -V | tail -n 1)
+          echo "Using Xcode: $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Resolve Swift Packages
+        run: xcodebuild -resolvePackageDependencies -project G2RemoteOS.xcodeproj -scheme G2RemoteOS
+
+      - name: Run Unit Tests (iOS Simulator)
+        run: |
+          SIM_ID=$(xcrun simctl list devices available iPhone -j | python3 -c "import sys, json; devs=[d for r in json.load(sys.stdin)['devices'].values() for d in r if d.get('isAvailable')]; print(devs[0]['udid'])")
+          echo "Running tests on simulator: $SIM_ID"
+          xcodebuild test \
+            -project G2RemoteOS.xcodeproj \
+            -scheme G2RemoteOS \
+            -destination "platform=iOS Simulator,id=$SIM_ID" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Build Unsigned Release App (arm64 iOS)
+        run: |
+          xcodebuild build \
+            -project G2RemoteOS.xcodeproj \
+            -scheme G2RemoteOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Package Unsigned IPA for SideStore
+        run: |
+          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/G2RemoteOS.app"
+          test -d "$APP_PATH"
+          echo "=== Verifying Info.plist background modes ==="
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$APP_PATH/Info.plist"
+          echo "=== Verifying embedded frameworks ==="
+          ls -la "$APP_PATH/Frameworks" || true
+          mkdir -p build/Payload
+          cp -R "$APP_PATH" build/Payload/
+          cd build
+          zip -qry G2RemoteOS.ipa Payload
+          ls -lh G2RemoteOS.ipa
+
+      - name: Upload G2RemoteOS.ipa Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: G2RemoteOS-ipa
+          path: build/G2RemoteOS.ipa
+          retention-days: 30

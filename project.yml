@@ -1,0 +1,67 @@
+name: G2RemoteOS
+options:
+  bundleIdPrefix: com.g2remote
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+
+packages:
+  flic2lib:
+    url: https://github.com/50ButtonsEach/flic2lib-ios.git
+    branch: master
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1"
+    SUPPORTS_MACCATALYST: NO
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Manual
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  G2RemoteOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: Sources
+    resources:
+      - path: Resources/Assets.xcassets
+    dependencies:
+      - package: flic2lib
+        product: flic2lib
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.g2remote.os
+        PRODUCT_NAME: G2RemoteOS
+        INFOPLIST_FILE: Resources/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_BITCODE: NO
+        CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+
+  G2RemoteOSTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: Tests
+    dependencies:
+      - target: G2RemoteOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.g2remote.os.tests
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  G2RemoteOS:
+    build:
+      targets:
+        G2RemoteOS: all
+        G2RemoteOSTests: [test]
+    test:
+      targets:
+        - G2RemoteOSTests
