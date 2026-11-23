@@ -4,7 +4,6 @@ import XCTest
 final class G2ProtocolTests: XCTestCase {
 
     func testCRC16CCITTFalseMatchesStandardVector() {
-        // Standard check value for CRC-16/CCITT-FALSE ("123456789") is 0x29B1.
         let crc = CRC16.ccittFalse(Data("123456789".utf8))
         XCTAssertEqual(crc, 0x29B1)
         XCTAssertEqual(CRC16.ccittFalseBytes(Data("123456789".utf8)), Data([0xB1, 0x29]))
@@ -12,9 +11,6 @@ final class G2ProtocolTests: XCTestCase {
 
     func testAuthFrameMatchesLiveCapturedShape() {
         let frame = G2Frame.authFrame(magic: 1)
-        // Header: AA 21 01 0C 01 01 80 00
-        // Payload (10 bytes): 08 04 10 01 1A 04 08 01 10 04
-        // Trailing 2 bytes: CRC-16/CCITT-FALSE LE of payload
         XCTAssertEqual(frame.count, 20)
         XCTAssertEqual(Data(frame[0..<8]), Data([0xAA, 0x21, 0x01, 0x0C, 0x01, 0x01, 0x80, 0x00]))
         let payload = Data([0x08, 0x04, 0x10, 0x01, 0x1A, 0x04, 0x08, 0x01, 0x10, 0x04])
@@ -37,7 +33,6 @@ final class G2ProtocolTests: XCTestCase {
         let frames = G2Frame.framePb(pb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, seq: 77, maxWrite: 80)
         XCTAssertGreaterThan(frames.count, 1)
 
-        // Every fragment must share the same `seq` byte (firmware reassembly group key).
         for (idx, f) in frames.enumerated() {
             XCTAssertEqual(f[2], 77)
             XCTAssertEqual(Int(f[4]), frames.count)
@@ -55,13 +50,34 @@ final class G2ProtocolTests: XCTestCase {
         XCTAssertEqual(parsed?.payload, pb)
     }
 
-    func testAudioControlCommandEncoding() {
+    func testAudioAndImuControlCommandEncoding() {
         let onPb = G2Commands.buildAudioControl(magic: 15, enable: true)
         XCTAssertEqual(ProtobufLite.readVarintField(onPb, field: 1), 15)
         XCTAssertEqual(ProtobufLite.readVarintField(onPb, field: 2), 15)
         let inner = ProtobufLite.readBytesField(onPb, field: 18)
         XCTAssertNotNil(inner)
         XCTAssertEqual(ProtobufLite.readVarintField(inner!, field: 1), 1)
+
+        let imuPb = G2Commands.buildImuControl(magic: 20, enable: true, reportFreqMs: 250)
+        XCTAssertEqual(ProtobufLite.readVarintField(imuPb, field: 1), 19)
+        let imuInner = ProtobufLite.readBytesField(imuPb, field: 22)
+        XCTAssertNotNil(imuInner)
+        XCTAssertEqual(ProtobufLite.readVarintField(imuInner!, field: 1), 1)
+        XCTAssertEqual(ProtobufLite.readVarintField(imuInner!, field: 2), 250)
+    }
+
+    func testFourBitBmpEncodingHeaderAndSize() {
+        let canvas = G2PixelCanvas(width: 40, height: 24)
+        canvas.drawBigClock("12:34", originX: 0, originY: 2, digitW: 6, digitH: 18, thickness: 2, spacing: 1)
+        let packed = canvas.pack4bpp()
+        XCTAssertEqual(packed.count, 20 * 24)
+
+        let bmp = G2PixelCanvas.encodeBmp4bpp(packed: packed, width: 40, height: 24)
+        // Header (14 + 40 + 64 = 118) + 20-byte rows (already multiple of 4) * 24 = 598
+        XCTAssertEqual(bmp.count, 118 + 20 * 24)
+        XCTAssertEqual(bmp[0], 0x42) // 'B'
+        XCTAssertEqual(bmp[1], 0x4D) // 'M'
+        XCTAssertEqual(bmp[28], 4)   // 4 bpp
     }
 
     func testLensNameParsing() {
@@ -77,12 +93,9 @@ final class G2ProtocolTests: XCTestCase {
 
     func testMicPacketParsing() {
         var raw = Data(repeating: 0x55, count: 200)
-        // signalRatio = -120 (0xFF88 LE -> 0x88, 0xFF)
-        raw.append(contentsOf: [0x88, 0xFF])
-        // direction = 270 (0x010E LE -> 0x0E, 0x01)
-        raw.append(contentsOf: [0x0E, 0x01])
-        // counter = 99
-        raw.append(99)
+        raw.append(contentsOf: [0x88, 0xFF]) // signalRatio = -120
+        raw.append(contentsOf: [0x0E, 0x01]) // direction = 270
+        raw.append(99)                       // counter = 99
 
         let pkt = G2MicPacket.parse(raw)
         XCTAssertNotNil(pkt)
@@ -92,41 +105,65 @@ final class G2ProtocolTests: XCTestCase {
         XCTAssertEqual(pkt?.counter, 99)
     }
 
-    func testHomeGridNavigationAndAlwaysOnProtection() {
+    func testDashboardLauncherHeadUpAndPushToTalk() {
         let os = G2OSStateMachine()
         var micEvents: [Bool] = []
         var sleepCalled = false
         var brightnessSet: Int?
+        var heightSet: Int?
         os.onToggleMic = { micEvents.append($0) }
         os.onSetScreenAsleep = { if $0 { sleepCalled = true } }
         os.onSetBrightness = { brightnessSet = $0 }
+        os.onSetDisplayHeight = { heightSet = $0 }
 
-        // 1. Back (double-tap) on Home must NEVER sleep or exit to stock OS
+        // 1. Starts on stock-style Dashboard with multi-container + 4-bit pixel clock
+        XCTAssertEqual(os.currentScreen, .dashboard)
+        XCTAssertEqual(os.currentPage.textContainers.count, 3)
+        XCTAssertEqual(os.currentPage.imageContainers.count, 1)
+        XCTAssertEqual(os.currentPage.textContainers.filter(\.captureEvents).count, 1)
+
+        // 2. Back on Dashboard NEVER sleeps or exits to stock OS
         os.handle(RemoteCommandEvent(action: .back, source: .motionPad))
-        XCTAssertEqual(os.currentScreen, .home)
-        XCTAssertFalse(os.isScreenAsleep)
+        XCTAssertEqual(os.currentScreen, .dashboard)
         XCTAssertFalse(sleepCalled)
 
-        // 2. Navigate 2x2 Home grid: Right -> (0,1) Memo Reader, Down -> (1,1) Settings, Tap -> open Settings
+        // 3. Swipe right cycles Dashboard widgets, tap opens 3x2 bordered App Launcher
         os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
+        XCTAssertEqual(os.dashboardTab, 1)
+        os.handle(RemoteCommandEvent(action: .select, source: .motionPad))
+        XCTAssertEqual(os.currentScreen, .launcher)
+        XCTAssertEqual(os.currentPage.textContainers.count, 7) // header + 6 bordered app cards
+        XCTAssertEqual(os.currentPage.textContainers.filter(\.captureEvents).count, 1)
+
+        // 4. Navigate to Hardware Settings (row 1, col 2) and adjust brightness + display height
         os.handle(RemoteCommandEvent(action: .down, source: .motionPad))
+        os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
+        os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
         os.handle(RemoteCommandEvent(action: .select, source: .motionPad))
         XCTAssertEqual(os.currentScreen, .settings)
-
-        // 3. Adjust brightness inside Settings via swipe right
         os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
         XCTAssertEqual(brightnessSet, 30)
+        os.handle(RemoteCommandEvent(action: .down, source: .motionPad))
+        os.handle(RemoteCommandEvent(action: .down, source: .motionPad))
+        os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
+        XCTAssertEqual(heightSet, 12)
 
-        // 4. Double-tap returns to Home
-        os.handle(RemoteCommandEvent(action: .back, source: .motionPad))
-        XCTAssertEqual(os.currentScreen, .home)
+        // 5. Head-Up transparent standby wakes via IMU tilt
+        os.setHeadUpWakeMode(true)
+        os.handleImuSample(G2ImuSample(x: 0, y: 0, z: 1))
+        os.calibrateHeadUpNeutral()
+        os.enterHeadUpStandby()
+        XCTAssertTrue(os.isHeadUpDimmed)
+        XCTAssertTrue(os.currentPage.isBlankTransparent)
 
-        // 5. Push-to-Talk: Hold -> micStart (open), Release -> micStop (close), idempotent
+        os.handleImuSample(G2ImuSample(x: 0, y: 0.6, z: 0.8)) // ~36.9 deg tilt
+        XCTAssertFalse(os.isHeadUpDimmed)
+        XCTAssertEqual(os.currentScreen, .dashboard)
+
+        // 6. Global Push-to-Talk mic open / close (idempotent)
         os.handle(RemoteCommandEvent(action: .micStart, source: .motionPad))
         os.handle(RemoteCommandEvent(action: .micStart, source: .motionPad))
         XCTAssertTrue(os.isMicOn)
-        XCTAssertTrue(os.renderedFrameText.contains("MIC 듣는 중"))
-
         os.handle(RemoteCommandEvent(action: .micStop, source: .motionPad))
         os.handle(RemoteCommandEvent(action: .micStop, source: .motionPad))
         XCTAssertFalse(os.isMicOn)

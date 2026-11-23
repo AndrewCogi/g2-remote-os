@@ -1,8 +1,9 @@
 import SwiftUI
 
-/// Clean 2:1 (576x288) monochrome green display mirror matching the G2 optical waveguide.
+/// True 1:1 (576x288) monochrome green live mirror rendering the exact G2PageSpec
+/// (multi-container rounded cards + 4-bit 16-level pixel bitmap graphics).
 struct G2MirrorView: View {
-    let text: String
+    let page: G2PageSpec
     let isConnected: Bool
     let isMicOn: Bool
     let alwaysOnActive: Bool
@@ -33,6 +34,10 @@ struct G2MirrorView: View {
                             .font(.system(size: 10, weight: .bold, design: .monospaced))
                             .foregroundColor(.red)
                     }
+                } else if page.isBlankTransparent {
+                    Text("들어깨우기 대기")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.mint)
                 } else {
                     Text("576×288")
                         .font(.system(size: 10, design: .monospaced))
@@ -40,20 +45,49 @@ struct G2MirrorView: View {
                 }
             }
 
+            G2CanvasPreview(page: page, isConnected: isConnected, isMicOn: isMicOn, compact: false)
+                .aspectRatio(2.0, contentMode: .fit)
+        }
+    }
+}
+
+/// Ultra-dim translucent 1:1 preview optionally toggled inside the fullscreen Motion Pad.
+struct G2MiniMirrorStrip: View {
+    let page: G2PageSpec
+    let isMicOn: Bool
+
+    var body: some View {
+        G2CanvasPreview(page: page, isConnected: true, isMicOn: isMicOn, compact: true)
+            .aspectRatio(2.0, contentMode: .fit)
+            .opacity(0.86)
+    }
+}
+
+private struct G2CanvasPreview: View {
+    let page: G2PageSpec
+    let isConnected: Bool
+    let isMicOn: Bool
+    let compact: Bool
+
+    var body: some View {
+        GeometryReader { geo in
+            let sx = geo.size.width / 576.0
+            let sy = geo.size.height / 288.0
+
             ZStack(alignment: .topLeading) {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                RoundedRectangle(cornerRadius: compact ? 14 : 18, style: .continuous)
                     .fill(
                         LinearGradient(
                             colors: [
-                                Color(red: 0.02, green: 0.055, blue: 0.03),
-                                Color(red: 0.01, green: 0.035, blue: 0.018)
+                                Color(red: 0.015, green: 0.05, blue: 0.025),
+                                Color(red: 0.008, green: 0.03, blue: 0.015)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
                     )
                     .overlay(
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        RoundedRectangle(cornerRadius: compact ? 14 : 18, style: .continuous)
                             .stroke(
                                 isMicOn
                                     ? Color.red.opacity(0.55)
@@ -62,39 +96,81 @@ struct G2MirrorView: View {
                             )
                     )
 
-                Text(text)
-                    .font(.system(size: 12.5, weight: .medium, design: .monospaced))
-                    .foregroundColor(Color(red: 0.26, green: 1.0, blue: 0.48))
-                    .lineSpacing(4)
-                    .padding(14)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                if page.isBlankTransparent {
+                    VStack(spacing: 6) {
+                        Image(systemName: "eyeglasses")
+                            .font(.title3)
+                            .foregroundColor(.green.opacity(0.35))
+                        Text("들어깨우기 투명 대기 중 (고개 들기 또는 터치)")
+                            .font(.system(size: compact ? 9.5 : 11, design: .monospaced))
+                            .foregroundColor(.green.opacity(0.45))
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    // Render 4-bit pixel image containers
+                    ForEach(page.imageContainers) { img in
+                        G2BitmapPreview(image: img)
+                            .frame(width: CGFloat(img.width) * sx, height: CGFloat(img.height) * sy)
+                            .offset(x: CGFloat(img.x) * sx, y: CGFloat(img.y) * sy)
+                    }
+
+                    // Render multi-container text cards with exact proportional geometry & borders
+                    ForEach(page.textContainers) { tc in
+                        let borderOpacity = tc.borderWidth > 0 ? max(0.18, Double(tc.borderColor) / 16.0) : 0.0
+                        let fontSize = max(7.0, (compact ? 10.0 : 12.2) * (geo.size.width / 360.0))
+
+                        Text(tc.text)
+                            .font(.system(size: fontSize, weight: .medium, design: .monospaced))
+                            .foregroundColor(Color(red: 0.26, green: 1.0, blue: 0.48))
+                            .lineSpacing(1.5)
+                            .padding(CGFloat(tc.padding) * sx)
+                            .frame(
+                                width: CGFloat(tc.width) * sx,
+                                height: CGFloat(tc.height) * sy,
+                                alignment: .topLeading
+                            )
+                            .clipped()
+                            .overlay(
+                                RoundedRectangle(cornerRadius: CGFloat(tc.borderRadius) * sx, style: .continuous)
+                                    .stroke(
+                                        Color(red: 0.26, green: 1.0, blue: 0.48).opacity(borderOpacity),
+                                        lineWidth: max(0, CGFloat(tc.borderWidth) * sx)
+                                    )
+                            )
+                            .offset(x: CGFloat(tc.x) * sx, y: CGFloat(tc.y) * sy)
+                    }
+                }
             }
-            .aspectRatio(2.0, contentMode: .fit)
         }
     }
 }
 
-/// Ultra-dim translucent preview optionally toggled inside the fullscreen Motion Pad.
-struct G2MiniMirrorStrip: View {
-    let text: String
-    let isMicOn: Bool
+/// Renders a 4-bit packed monochrome green G2ImageContainer directly in SwiftUI Canvas.
+private struct G2BitmapPreview: View {
+    let image: G2ImageContainer
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color(red: 0.02, green: 0.06, blue: 0.03).opacity(0.82))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(isMicOn ? Color.red.opacity(0.5) : Color.green.opacity(0.32), lineWidth: 1)
-                )
+        Canvas { context, size in
+            let w = image.width
+            let h = image.height
+            guard w > 0, h > 0 else { return }
+            let stride = (w + 1) / 2
+            let bytes = Array(image.packed4bpp)
+            guard bytes.count >= stride * h else { return }
 
-            Text(text)
-                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                .foregroundColor(Color(red: 0.28, green: 0.95, blue: 0.48).opacity(0.85))
-                .lineSpacing(2.5)
-                .padding(11)
-                .frame(maxWidth: .infinity, alignment: .topLeading)
+            let pw = size.width / CGFloat(w)
+            let ph = size.height / CGFloat(h)
+
+            for r in 0..<h {
+                for c in 0..<w {
+                    let b = bytes[r * stride + (c / 2)]
+                    let nibble = (c % 2 == 0) ? (b >> 4) : (b & 0x0F)
+                    if nibble == 0 { continue }
+                    let alpha = Double(nibble) / 15.0
+                    let rect = CGRect(x: CGFloat(c) * pw, y: CGFloat(r) * ph, width: max(0.8, pw + 0.15), height: max(0.8, ph + 0.15))
+                    context.fill(Path(rect), with: .color(Color(red: 0.26, green: 1.0, blue: 0.48).opacity(alpha)))
+                }
+            }
         }
-        .aspectRatio(2.15, contentMode: .fit)
     }
 }

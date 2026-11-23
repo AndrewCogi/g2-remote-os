@@ -6,7 +6,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        // Initialize CoreBluetooth + Flic background manager immediately on cold/background launch.
+        // Initialize CoreBluetooth + Flic background manager + live services immediately on launch.
         AppCoordinator.shared.bootstrap()
         return true
     }
@@ -25,6 +25,10 @@ struct G2RemoteOSApp: App {
                 .environmentObject(coordinator.flic)
                 .environmentObject(coordinator.os)
                 .environmentObject(coordinator.backgroundKeeper)
+                .environmentObject(coordinator.weather)
+                .environmentObject(coordinator.calendar)
+                .environmentObject(coordinator.pedometer)
+                .environmentObject(coordinator.clockTools)
                 .preferredColorScheme(.dark)
         }
     }

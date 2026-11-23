@@ -104,7 +104,7 @@ struct MotionPadFullscreenView: View {
 
                 if showMiniMirror {
                     G2MiniMirrorStrip(
-                        text: os.renderedFrameText,
+                        page: os.currentPage,
                         isMicOn: ble.isMicEnabled
                     )
                     .padding(.horizontal, 18)

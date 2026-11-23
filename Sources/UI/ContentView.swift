@@ -1,23 +1,25 @@
 import SwiftUI
 import UIKit
 
-/// Minimalist, uncluttered dark hub for G2 OS.
-/// Features a live G2 mirror, one-tap Fullscreen Motion Pad launch, quick utilities,
-/// and dedicated sheets for Device Connection and Settings.
+/// Minimalist dark hub for G2 OS.
+/// Features a true 1:1 multi-container + 4-bit pixel G2 mirror, one-tap Fullscreen Motion Pad launch,
+/// quick tools/alarm access, and dedicated sheets for Connection, Tools, and Full Hardware Settings.
 struct ContentView: View {
     @EnvironmentObject var coordinator: AppCoordinator
     @EnvironmentObject var ble: G2BLEManager
     @EnvironmentObject var flic: FlicDuoDriver
     @EnvironmentObject var os: G2OSStateMachine
     @EnvironmentObject var keeper: BackgroundKeeper
+    @EnvironmentObject var calendar: CalendarQuickListService
+    @EnvironmentObject var clockTools: AlarmTimerService
 
     @State private var showMotionPad = false
     @State private var showConnectionSheet = false
+    @State private var showToolsSheet = false
     @State private var showSettingsSheet = false
 
     var body: some View {
         ZStack {
-            // Deep obsidian backdrop
             LinearGradient(
                 colors: [
                     Color(red: 0.03, green: 0.04, blue: 0.035),
@@ -28,11 +30,15 @@ struct ContentView: View {
             )
             .ignoresSafeArea()
 
-            VStack(spacing: 18) {
+            VStack(spacing: 16) {
                 headerBar
 
+                if let alert = clockTools.activeAlert {
+                    activeAlertBanner(alert)
+                }
+
                 G2MirrorView(
-                    text: os.renderedFrameText,
+                    page: os.currentPage,
                     isConnected: ble.phase == .connected,
                     isMicOn: ble.isMicEnabled,
                     alwaysOnActive: coordinator.keepAliveEnabled && keeper.isActive
@@ -50,7 +56,6 @@ struct ContentView: View {
             .padding(.top, 10)
             .padding(.bottom, 14)
 
-            // Hidden keyboard listener for optional Bluetooth keyboard testing
             KeyboardCaptureView { event in
                 os.handle(event)
             }
@@ -74,6 +79,16 @@ struct ContentView: View {
             .environmentObject(flic)
             .preferredColorScheme(.dark)
         }
+        .sheet(isPresented: $showToolsSheet) {
+            NavigationStack {
+                ToolsSheetView()
+            }
+            .environmentObject(coordinator)
+            .environmentObject(os)
+            .environmentObject(calendar)
+            .environmentObject(clockTools)
+            .preferredColorScheme(.dark)
+        }
         .sheet(isPresented: $showSettingsSheet) {
             NavigationStack {
                 SettingsLogView()
@@ -82,6 +97,7 @@ struct ContentView: View {
             .environmentObject(ble)
             .environmentObject(os)
             .environmentObject(keeper)
+            .environmentObject(calendar)
             .preferredColorScheme(.dark)
         }
     }
@@ -115,6 +131,13 @@ struct ContentView: View {
             Spacer()
 
             headerIconButton(
+                systemName: "alarm.fill",
+                tint: clockTools.activeAlert != nil ? .red : .white.opacity(0.85)
+            ) {
+                showToolsSheet = true
+            }
+
+            headerIconButton(
                 systemName: "dot.radiowaves.left.and.right",
                 tint: ble.phase == .connected ? .green : .white.opacity(0.85)
             ) {
@@ -130,12 +153,42 @@ struct ContentView: View {
         }
     }
 
+    private func activeAlertBanner(_ alert: G2ActiveAlert) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "bell.badge.fill")
+                .foregroundColor(.red)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(alert.kind.rawValue)
+                    .font(.caption2.bold())
+                    .foregroundColor(.red)
+                Text(alert.title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.white)
+            }
+            Spacer()
+            Button("끄기") {
+                clockTools.dismissActiveAlert()
+            }
+            .font(.caption.bold())
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.red.opacity(0.16))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.red.opacity(0.45), lineWidth: 1)
+        )
+    }
+
     private func headerIconButton(systemName: String, tint: Color, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemName)
-                .font(.system(size: 16, weight: .semibold))
+                .font(.system(size: 15, weight: .semibold))
                 .foregroundColor(tint)
-                .frame(width: 40, height: 40)
+                .frame(width: 38, height: 38)
                 .background(Color.white.opacity(0.07))
                 .clipShape(Circle())
                 .overlay(
@@ -168,7 +221,7 @@ struct ContentView: View {
         Button {
             showMotionPad = true
         } label: {
-            VStack(spacing: 18) {
+            VStack(spacing: 16) {
                 HStack {
                     HStack(spacing: 10) {
                         ZStack {
@@ -200,7 +253,6 @@ struct ContentView: View {
                         .clipShape(Circle())
                 }
 
-                // Clean 2x2 Gesture Guide Grid
                 LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
                     gestureTile(icon: "arrow.up.and.down.and.arrow.left.and.right", title: "스와이프", subtitle: "상하좌우 이동")
                     gestureTile(icon: "hand.tap", title: "한 번 탭", subtitle: "클릭 · 선택")
@@ -208,7 +260,7 @@ struct ContentView: View {
                     gestureTile(icon: "mic.fill", title: "길게 누르기", subtitle: "마이크 (떼면 끄기)")
                 }
             }
-            .padding(18)
+            .padding(16)
             .frame(maxWidth: .infinity)
             .background(
                 RoundedRectangle(cornerRadius: 22, style: .continuous)
@@ -259,8 +311,8 @@ struct ContentView: View {
 
     private var quickActionBar: some View {
         HStack(spacing: 10) {
-            quickPill(icon: "house.fill", title: "홈") {
-                coordinator.triggerMotionAction(.home, detail: "빠른 홈")
+            quickPill(icon: "house.fill", title: "대시보드") {
+                coordinator.triggerMotionAction(.home, detail: "대시보드")
             }
 
             HStack(spacing: 0) {
@@ -270,13 +322,13 @@ struct ContentView: View {
                     Image(systemName: "sun.min")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(.white.opacity(0.85))
-                        .frame(width: 40, height: 42)
+                        .frame(width: 38, height: 42)
                 }
 
                 Text("\(ble.brightnessLevel)")
                     .font(.caption.monospacedDigit().weight(.semibold))
                     .foregroundColor(.green)
-                    .frame(minWidth: 26)
+                    .frame(minWidth: 24)
 
                 Button {
                     coordinator.triggerMotionAction(.brightnessUp, detail: "밝기+")
@@ -284,7 +336,7 @@ struct ContentView: View {
                     Image(systemName: "sun.max.fill")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(.white.opacity(0.85))
-                        .frame(width: 40, height: 42)
+                        .frame(width: 38, height: 42)
                 }
             }
             .background(Color.white.opacity(0.06))
@@ -328,7 +380,7 @@ struct ContentView: View {
             Image(systemName: coordinator.keepAliveEnabled ? "lock.shield.fill" : "lock.open")
                 .font(.caption2)
                 .foregroundColor(coordinator.keepAliveEnabled ? .green : .orange)
-            Text(coordinator.keepAliveEnabled ? "항시 G2 OS 유지 중 · 기존 OS 복귀 차단" : "항시 유지 꺼짐")
+            Text(os.headUpWakeEnabled ? "항시 OS 유지 · 들어깨우기 ON" : (coordinator.keepAliveEnabled ? "항시 G2 OS 유지 중" : "항시 유지 꺼짐"))
                 .font(.caption2)
                 .foregroundColor(.white.opacity(0.5))
 
@@ -339,7 +391,7 @@ struct ContentView: View {
                     .font(.caption2.weight(.medium))
                     .foregroundColor(.green.opacity(0.85))
             } else {
-                Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.2")")
+                Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3")")
                     .font(.caption2.monospaced())
                     .foregroundColor(.white.opacity(0.32))
             }

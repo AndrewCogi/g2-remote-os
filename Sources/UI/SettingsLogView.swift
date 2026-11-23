@@ -6,17 +6,12 @@ struct SettingsLogView: View {
     @EnvironmentObject var ble: G2BLEManager
     @EnvironmentObject var os: G2OSStateMachine
     @EnvironmentObject var keeper: BackgroundKeeper
+    @EnvironmentObject var calendar: CalendarQuickListService
 
-    @State private var customTitle: String = "내 메모"
-    @State private var customBody: String = """
-    여기에 발표 대본이나 메모를 입력하세요.
-    저장하면 G2 안경의 '메모 리더'에 즉시 반영됩니다.
-    모션 패드에서 위/아래 스와이프로 스크롤하세요.
-    """
     @State private var showLogs: Bool = false
 
     private var appVersionText: String {
-        let short = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.2.0"
+        let short = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.0"
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
         return "v\(short) (Build \(build))"
     }
@@ -26,10 +21,18 @@ struct SettingsLogView: View {
             Section {
                 Toggle("항시 G2 OS 유지 (기존 OS 복귀 차단)", isOn: $coordinator.keepAliveEnabled)
 
+                Toggle("4-bit 픽셀 그래픽 시계 (대시보드)", isOn: Binding(
+                    get: { os.pixelGraphicsEnabled },
+                    set: {
+                        os.pixelGraphicsEnabled = $0
+                        os.refreshDisplay(pushToGlasses: true)
+                    }
+                ))
+
                 HStack {
                     Text("백그라운드 보호")
                     Spacer()
-                    Text(keeper.isActive ? "동작 중 (3.5초 하트비트 보호)" : "꺼짐")
+                    Text(keeper.isActive ? "동작 중 (3.5초 하트비트)" : "꺼짐")
                         .font(.caption)
                         .foregroundColor(keeper.isActive ? .green : .secondary)
                 }
@@ -38,21 +41,138 @@ struct SettingsLogView: View {
                     ble.ensureScreenActive(forceRecreate: true)
                 }
             } header: {
-                Text("OS 항시 유지")
+                Text("OS 항시 유지 & 그래픽")
             } footer: {
-                Text("켜두면 아이폰 화면을 꺼도 무음 오디오 믹스와 3.5초 하트비트로 G2가 기본 OS로 돌아가지 않도록 유지하며, 이탈 신호가 감지되어도 자동으로 복귀합니다.")
+                Text("항시 유지가 켜져 있으면 화면을 꺼도 기본 OS로 돌아가지 않습니다.")
             }
 
-            Section("메모 리더 문서 편집") {
-                TextField("문서 제목", text: $customTitle)
-                TextEditor(text: $customBody)
-                    .frame(height: 110)
-                    .font(.caption)
-                Button("G2 메모 리더에 반영") {
-                    os.updateCustomDocument(title: customTitle, body: customBody)
-                    coordinator.appendLog("[OS] 사용자 메모 반영: \(customTitle)")
+            Section {
+                Toggle("들어깨우기 (고개 들기 대기)", isOn: Binding(
+                    get: { os.headUpWakeEnabled },
+                    set: {
+                        os.setHeadUpWakeMode($0)
+                        ble.setImuStreaming($0, reportFreqMs: 250)
+                    }
+                ))
+
+                Stepper("깨우기 각도: \(os.headUpTriggerAngle)°", value: Binding(
+                    get: { os.headUpTriggerAngle },
+                    set: {
+                        os.headUpTriggerAngle = $0
+                        ble.setHeadUp(enabled: os.headUpWakeEnabled, angle: $0)
+                    }
+                ), in: 10...50, step: 5)
+
+                Stepper("자동 투명 대기: \(os.headUpIdleSeconds)초", value: $os.headUpIdleSeconds, in: 8...60, step: 5)
+
+                HStack {
+                    Text("실시간 IMU 각도")
+                    Spacer()
+                    Text(String(format: "%+.1f° (변화 %+.1f°)", os.currentImu.pitchDegrees, os.lastDeltaPitch))
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(.green)
                 }
-                .buttonStyle(.borderedProminent)
+
+                HStack(spacing: 10) {
+                    Button("현재 자세 0° 보정") {
+                        os.calibrateHeadUpNeutral()
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button(os.isHeadUpDimmed ? "화면 깨우기" : "투명 대기 테스트") {
+                        if os.isHeadUpDimmed { os.wakeFromHeadUpStandby() } else { os.enterHeadUpStandby() }
+                    }
+                    .buttonStyle(.bordered)
+                }
+            } header: {
+                Text("들어깨우기 (G2 IMU)")
+            } footer: {
+                Text("켜두면 일정 시간 후 렌즈가 완전 투명 상태로 대기하며, 고개를 들거나 패드를 터치하면 0.1초 만에 우리 OS가 다시 뜹니다(기본 OS 이탈 없음).")
+            }
+
+            Section {
+                Toggle("자동 밝기", isOn: Binding(
+                    get: { ble.brightnessAuto },
+                    set: {
+                        os.autoBrightness = $0
+                        ble.setAutoBrightness($0)
+                    }
+                ))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("수동 밝기")
+                        Spacer()
+                        Text("\(ble.brightnessLevel) / 50")
+                            .font(.caption.monospacedDigit())
+                            .foregroundColor(.green)
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { Double(ble.brightnessLevel) },
+                            set: {
+                                let v = Int($0)
+                                os.brightness = v
+                                ble.setBrightness(v)
+                            }
+                        ),
+                        in: 1...50,
+                        step: 1
+                    )
+                }
+
+                Stepper("화면 높이 (Y): \(ble.displayHeight) / 20", value: Binding(
+                    get: { ble.displayHeight },
+                    set: {
+                        os.displayHeight = $0
+                        ble.setDisplayHeight($0)
+                    }
+                ), in: 0...20)
+
+                Stepper("화면 거리 (X): \(ble.displayDistance) / 20", value: Binding(
+                    get: { ble.displayDistance },
+                    set: {
+                        os.displayDistance = $0
+                        ble.setDisplayDistance($0)
+                    }
+                ), in: 0...20)
+
+                Toggle("착용 감지 (Wear Detection)", isOn: Binding(
+                    get: { ble.wearDetection },
+                    set: {
+                        os.wearDetection = $0
+                        ble.setWearDetection($0)
+                    }
+                ))
+
+                Toggle("무음 모드 (Silent Mode)", isOn: Binding(
+                    get: { ble.silentMode },
+                    set: {
+                        os.silentMode = $0
+                        ble.setSilentMode($0)
+                    }
+                ))
+
+                Toggle("ANCS 시스템 알림 허용 (실험)", isOn: Binding(
+                    get: { ble.ancsEnabled },
+                    set: {
+                        os.ancsEnabled = $0
+                        ble.setAncsNotifications(enabled: $0)
+                    }
+                ))
+            } header: {
+                Text("G2 하드웨어 설정 (순정 전체)")
+            } footer: {
+                Text("ANCS 알림은 아이폰 설정 > Bluetooth > G2 > '시스템 알림 공유'가 켜져 있어야 동작합니다.")
+            }
+
+            Section("데이터 연동 (무료 온디바이스)") {
+                Button("Apple 캘린더 · 미리알림 연동 허용") {
+                    calendar.requestAccessAndSync()
+                }
+                Button("날씨 · 일정 · 기기 상태 지금 새로고침") {
+                    coordinator.refreshAllData()
+                }
             }
 
             if let saved = coordinator.lastSavedRecordingPath {
@@ -90,7 +210,7 @@ struct SettingsLogView: View {
                     }
                 }
             } header: {
-                Text("진단")
+                Text("정보 & 진단")
             }
         }
         .tint(.green)

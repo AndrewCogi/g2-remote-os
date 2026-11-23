@@ -24,9 +24,10 @@ public enum G2ConnectionPhase: String {
 /// Manages dual-lens CoreBluetooth links to Even Realities G2 glasses with:
 /// - Background `bluetooth-central` State Restoration & unexpected-drop auto-reconnection
 /// - Always-On OS Guard: 3.5s heartbeat + iOS suspension gap detection + stock-OS exit interception
-/// - Serialized packet write queue (prevents multi-fragment reassembly corruption)
-/// - Live-confirmed Auth -> Prelude -> EvenHub CreatePage / TextUpgrade -> Heartbeat -> 60s Keepalive
-/// - Raw LC3 microphone stream subscription on 0x6402
+/// - Multi-container EvenHub rendering (`cmd 0` Create, `cmd 7` Rebuild, `cmd 5` Text diff, `cmd 3` 4-bit BMP image upload)
+/// - Live G2 IMU stream (`cmd 19`) for Head-Up Raise-to-Wake inside our custom OS
+/// - Full `SID 0x09` / `0x20` hardware settings & `SID 0x04` ANCS notification whitelist control
+/// - Raw LC3 microphone stream subscription on `0x6402`
 public final class G2BLEManager: NSObject, ObservableObject {
     @Published public private(set) var bluetoothState: CBManagerState = .unknown
     @Published public private(set) var phase: G2ConnectionPhase = .disconnected
@@ -39,6 +40,13 @@ public final class G2BLEManager: NSObject, ObservableObject {
     @Published public private(set) var isCharging: Bool = false
     @Published public private(set) var silentMode: Bool = false
     @Published public private(set) var brightnessLevel: Int = 25
+    @Published public private(set) var brightnessAuto: Bool = false
+    @Published public private(set) var displayHeight: Int = 10
+    @Published public private(set) var displayDistance: Int = 10
+    @Published public private(set) var headUpEnabled: Bool = false
+    @Published public private(set) var headUpAngle: Int = 20
+    @Published public private(set) var wearDetection: Bool = true
+    @Published public private(set) var ancsEnabled: Bool = true
     @Published public private(set) var firmwareLeft: String = "-"
     @Published public private(set) var firmwareRight: String = "-"
     @Published public private(set) var isMicEnabled: Bool = false
@@ -50,6 +58,7 @@ public final class G2BLEManager: NSObject, ObservableObject {
 
     public var onLog: ((String) -> Void)?
     public var onGlassesEvent: ((G2DeviceEvent) -> Void)?
+    public var onImuSample: ((G2ImuSample) -> Void)?
     public var onMicPacket: ((G2MicPacket) -> Void)?
 
     private let bleQueue = DispatchQueue(label: "com.g2remote.os.ble", qos: .userInitiated)
@@ -72,16 +81,24 @@ public final class G2BLEManager: NSObject, ObservableObject {
     private var magicCounter: Int = 100
     private var seqCounter: UInt8 = 10
     private var authCounter: UInt8 = 1
+    private var imageMapSessionId: Int = 1
 
     private var sessionReady = false
     private var pageCreated = false
     private var screenAsleepLocked = false
     private var alwaysStayLocked = true
     private var micEnabledLocked = false
+    private var imuDesiredLocked = false
+    private var imuActiveLocked = false
+    private var ancsEnabledLocked = true
     private var userInitiatedDisconnect = false
     private var autoReconnectAttemptedOnBoot = false
 
-    private var lastRenderedText: String = "G2 OS 준비 중..."
+    private var lastRenderedPage: G2PageSpec = .blankTransparent()
+    private var activeLayoutKey: String?
+    private var lastPushedTexts: [Int: String] = [:]
+    private var uploadedImageHashes: [Int: String] = [:]
+
     private var lastHeartbeatSentAt: Date = .distantPast
     private var lastPageCreatedAt: Date = .distantPast
     private var recentExitRecoveries: [Date] = []
@@ -120,7 +137,7 @@ public final class G2BLEManager: NSObject, ObservableObject {
         )
     }
 
-    // MARK: - Public Controls
+    // MARK: - Connection Controls
 
     public func setAlwaysStayInCustomOS(_ enabled: Bool) {
         DispatchQueue.main.async { self.alwaysStayInCustomOS = enabled }
@@ -142,7 +159,6 @@ public final class G2BLEManager: NSObject, ObservableObject {
                 self.emitLog("[G2] 블루투스가 꺼져 있어 스캔할 수 없습니다.")
                 return
             }
-            // Cancel any pending half-open auto-reconnect before scanning fresh.
             if !self.sessionReady {
                 if let lp = self.leftPeripheral, lp.state == .connecting {
                     self.central.cancelPeripheralConnection(lp)
@@ -154,13 +170,11 @@ public final class G2BLEManager: NSObject, ObservableObject {
             self.setPhase(.scanning)
             self.emitLog("[G2] G2 좌/우 렌즈 스캔 시작 (공식 Even 앱이 연결 중이면 먼저 종료하세요)")
 
-            // Also inspect already-connected peripherals carrying the G2 control service.
             let connected = self.central.retrieveConnectedPeripherals(withServices: [G2Constants.serviceControl])
             for p in connected {
                 self.registerDiscoveredPeripheral(p, name: p.name, rssi: -50)
             }
 
-            // Foreground scan without service filter (G2 advertises by name + manufacturer data 0x5245).
             self.central.scanForPeripherals(
                 withServices: nil,
                 options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
@@ -238,8 +252,12 @@ public final class G2BLEManager: NSObject, ObservableObject {
             self.stopTimers()
             self.sessionReady = false
             self.pageCreated = false
+            self.activeLayoutKey = nil
+            self.lastPushedTexts.removeAll()
+            self.uploadedImageHashes.removeAll()
             self.handshakeStarted = false
             self.micEnabledLocked = false
+            self.imuActiveLocked = false
             self.screenAsleepLocked = false
             self.writeQueue.removeAll()
 
@@ -260,7 +278,6 @@ public final class G2BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// Re-verifies our custom OS is actively rendered on the glasses (called on foreground or user tap).
     public func ensureScreenActive(forceRecreate: Bool = false) {
         bleQueue.async { [weak self] in
             guard let self else { return }
@@ -275,28 +292,81 @@ public final class G2BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// Renders full-screen text on the G2 576x288 EvenHub canvas.
-    /// Automatically recovers the page if the glasses slept or dropped to stock OS.
-    public func renderScreenText(_ text: String) {
+    // MARK: - Multi-Container & 4-bit Image Display Rendering
+
+    /// Renders a multi-container G2PageSpec onto the 576x288 EvenHub canvas.
+    /// Uses fast differential `cmd 5` text upgrades when layout is unchanged, `cmd 7` rebuild on layout change,
+    /// and cached `cmd 3` 4-bit BMP fragment uploads for changed pixel graphics.
+    public func renderPage(_ page: G2PageSpec) {
         bleQueue.async { [weak self] in
             guard let self else { return }
-            self.lastRenderedText = text
+            self.lastRenderedPage = page
             guard self.sessionReady else { return }
 
             let now = Date()
             let heartbeatStale = now.timeIntervalSince(self.lastHeartbeatSentAt) > 8.5
 
             if self.screenAsleepLocked || !self.pageCreated || heartbeatStale {
-                self.recreatePageLocked(reason: "화면 깨우기/페이지 복구")
-            } else {
-                let upgradePb = G2Commands.buildTextUpgrade(magic: self.nextMagic(), text: text)
-                self.enqueueProtobuf(upgradePb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+                self.recreatePageLocked(reason: "화면 깨우기/페이지 생성")
+                return
+            }
+
+            if self.activeLayoutKey != page.layoutKey {
+                let rebuildPb = G2Commands.buildRebuildPage(magic: self.nextMagic(), page: page)
+                self.enqueueProtobuf(rebuildPb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+                self.activeLayoutKey = page.layoutKey
+                self.lastPushedTexts = Dictionary(uniqueKeysWithValues: page.textContainers.map { ($0.id, $0.text) })
+                self.uploadedImageHashes.removeAll()
+                self.enqueueImageUploadsLocked(page.imageContainers)
+                return
+            }
+
+            // Same layout -> push only text/image diffs (ultra-fast ~30ms per text container)
+            for tc in page.textContainers {
+                if self.lastPushedTexts[tc.id] != tc.text {
+                    let upgradePb = G2Commands.buildTextUpgrade(
+                        magic: self.nextMagic(),
+                        containerId: tc.id,
+                        containerName: tc.name,
+                        text: tc.text
+                    )
+                    self.enqueueProtobuf(upgradePb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+                    self.lastPushedTexts[tc.id] = tc.text
+                }
+            }
+            self.enqueueImageUploadsLocked(page.imageContainers)
+        }
+    }
+
+    /// Backwards-compatible plain text wrapper.
+    public func renderScreenText(_ text: String) {
+        let single = G2PageSpec(
+            layoutKey: "plain_single",
+            textContainers: [
+                G2TextContainer(id: 1, name: "dashboard", x: 0, y: 0, width: 576, height: 288, text: text, captureEvents: true)
+            ]
+        )
+        renderPage(single)
+    }
+
+    private func enqueueImageUploadsLocked(_ images: [G2ImageContainer]) {
+        for img in images {
+            guard uploadedImageHashes[img.id] != img.contentHash else { continue }
+            uploadedImageHashes[img.id] = img.contentHash
+            imageMapSessionId = (imageMapSessionId % 250) + 1
+            let payloads = G2Commands.buildImageUploadMessages(
+                image: img,
+                mapSessionId: imageMapSessionId,
+                nextMagic: { self.nextMagic() }
+            )
+            for pb in payloads {
+                enqueueProtobuf(pb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
             }
         }
     }
 
-    /// Opens or closes the G2 built-in microphone (SID 0xE0 cmd 15). Raw LC3 streams on 0x6402.
-    /// Idempotent so Push-to-Talk hold/release never sends redundant toggles.
+    // MARK: - Microphone & IMU Controls
+
     public func setMicrophoneEnabled(_ enabled: Bool) {
         bleQueue.async { [weak self] in
             guard let self else { return }
@@ -320,11 +390,23 @@ public final class G2BLEManager: NSObject, ObservableObject {
             }
             let pb = G2Commands.buildAudioControl(magic: self.nextMagic(), enable: enabled)
             self.enqueueProtobuf(pb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
-            self.emitLog("[G2] 내장 마이크 \(enabled ? "열기 (0x6402 LC3 수신 중)" : "끄기")")
+            self.emitLog("[G2] 내장 마이크 \(enabled ? "열기 (0x6402 LC3)" : "끄기")")
         }
     }
 
-    /// Exports the last recorded raw LC3 bytes to the app's Documents folder.
+    public func setImuStreaming(_ enabled: Bool, reportFreqMs: Int = 250) {
+        bleQueue.async { [weak self] in
+            guard let self else { return }
+            self.imuDesiredLocked = enabled
+            guard self.sessionReady else { return }
+            if enabled == self.imuActiveLocked { return }
+            self.imuActiveLocked = enabled
+            let pb = G2Commands.buildImuControl(magic: self.nextMagic(), enable: enabled, reportFreqMs: reportFreqMs)
+            self.enqueueProtobuf(pb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+            self.emitLog("[G2] IMU 센서 스트림 \(enabled ? "시작 (\(reportFreqMs)ms)" : "중지")")
+        }
+    }
+
     public func saveLastMicRecording() -> URL? {
         var snapshot = Data()
         bleQueue.sync { snapshot = self.micRecordingData }
@@ -344,6 +426,8 @@ public final class G2BLEManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Full Hardware Settings (SID 0x09 / 0x20 / 0x04)
+
     public func setBrightness(_ level: Int) {
         let clamped = max(1, min(50, level))
         DispatchQueue.main.async { self.brightnessLevel = clamped }
@@ -352,6 +436,69 @@ public final class G2BLEManager: NSObject, ObservableObject {
             let pb = G2Commands.buildBrightness(magic: self.nextMagic(), level: clamped)
             self.enqueueProtobuf(pb, sid: G2SID.settings, flag: G2Frame.flagRequest, side: .right)
             self.emitLog("[G2] 밝기 설정: \(clamped)/50")
+        }
+    }
+
+    public func setAutoBrightness(_ enabled: Bool) {
+        DispatchQueue.main.async { self.brightnessAuto = enabled }
+        bleQueue.async { [weak self] in
+            guard let self, self.sessionReady else { return }
+            let pb = G2Commands.buildAutoBrightness(magic: self.nextMagic(), enabled: enabled)
+            self.enqueueProtobuf(pb, sid: G2SID.settings, flag: G2Frame.flagRequest, side: .right)
+            self.emitLog("[G2] 자동 밝기: \(enabled ? "ON" : "OFF")")
+        }
+    }
+
+    public func setDisplayHeight(_ level: Int) {
+        let clamped = max(0, min(20, level))
+        DispatchQueue.main.async { self.displayHeight = clamped }
+        bleQueue.async { [weak self] in
+            guard let self, self.sessionReady else { return }
+            let pb = G2Commands.buildDisplayHeight(magic: self.nextMagic(), level: clamped)
+            self.enqueueProtobuf(pb, sid: G2SID.settings, flag: G2Frame.flagRequest, side: .right)
+            self.emitLog("[G2] 화면 높이(Y): \(clamped)/20")
+        }
+    }
+
+    public func setDisplayDistance(_ level: Int) {
+        let clamped = max(0, min(20, level))
+        DispatchQueue.main.async { self.displayDistance = clamped }
+        bleQueue.async { [weak self] in
+            guard let self, self.sessionReady else { return }
+            let pb = G2Commands.buildDisplayDistance(magic: self.nextMagic(), level: clamped)
+            self.enqueueProtobuf(pb, sid: G2SID.settings, flag: G2Frame.flagRequest, side: .right)
+            self.emitLog("[G2] 화면 거리(X): \(clamped)/20")
+        }
+    }
+
+    public func setHeadUp(enabled: Bool, angle: Int) {
+        let clamped = max(0, min(60, angle))
+        DispatchQueue.main.async {
+            self.headUpEnabled = enabled
+            self.headUpAngle = clamped
+        }
+        bleQueue.async { [weak self] in
+            guard let self else { return }
+            self.imuDesiredLocked = enabled
+            guard self.sessionReady else { return }
+            let pb = G2Commands.buildHeadUp(magic: self.nextMagic(), enabled: enabled, angle: clamped)
+            self.enqueueProtobuf(pb, sid: G2SID.settings, flag: G2Frame.flagRequest, side: .right)
+            if enabled != self.imuActiveLocked {
+                self.imuActiveLocked = enabled
+                let imuPb = G2Commands.buildImuControl(magic: self.nextMagic(), enable: enabled, reportFreqMs: 250)
+                self.enqueueProtobuf(imuPb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+            }
+            self.emitLog("[G2] 들어깨우기: \(enabled ? "ON (\(clamped)°)" : "OFF")")
+        }
+    }
+
+    public func setWearDetection(_ enabled: Bool) {
+        DispatchQueue.main.async { self.wearDetection = enabled }
+        bleQueue.async { [weak self] in
+            guard let self, self.sessionReady else { return }
+            let pb = G2Commands.buildWearDetection(magic: self.nextMagic(), enabled: enabled)
+            self.enqueueProtobuf(pb, sid: G2SID.settings, flag: G2Frame.flagRequest, side: .right)
+            self.emitLog("[G2] 착용 감지: \(enabled ? "ON" : "OFF")")
         }
     }
 
@@ -365,16 +512,31 @@ public final class G2BLEManager: NSObject, ObservableObject {
         }
     }
 
+    public func setAncsNotifications(enabled: Bool) {
+        DispatchQueue.main.async { self.ancsEnabled = enabled }
+        bleQueue.async { [weak self] in
+            guard let self else { return }
+            self.ancsEnabledLocked = enabled
+            guard self.sessionReady else { return }
+            let ctrlPb = G2Commands.buildNotificationCtrl(magic: self.nextMagic(), enable: enabled, autoDisplay: enabled, dispTime: 5, dnd: !enabled)
+            self.enqueueProtobuf(ctrlPb, sid: G2SID.notification, flag: G2Frame.flagRequest, side: .right)
+            if enabled {
+                let wlPb = G2Commands.buildWhitelistDisable(magic: self.nextMagic(), disable: true)
+                self.enqueueProtobuf(wlPb, sid: G2SID.notification, flag: G2Frame.flagRequest, side: .right)
+            }
+            self.emitLog("[G2] ANCS 알림 허용: \(enabled ? "ON (화이트리스트 해제)" : "OFF")")
+        }
+    }
+
     public func querySettings() {
         bleQueue.async { [weak self] in
             guard let self, self.sessionReady else { return }
             let pb = G2Commands.buildReadSettings(magic: self.nextMagic())
             self.enqueueProtobuf(pb, sid: G2SID.settings, flag: G2Frame.flagRequest, side: .right)
-            self.emitLog("[G2] 기기 상태(배터리/밝기/펌웨어) 조회 요청")
+            self.emitLog("[G2] 기기 상태 조회 요청")
         }
     }
 
-    /// Puts the EvenHub canvas to sleep (only when Always-On OS lock is OFF) or wakes it immediately.
     public func setScreenAsleep(_ asleep: Bool) {
         bleQueue.async { [weak self] in
             guard let self else { return }
@@ -388,7 +550,8 @@ public final class G2BLEManager: NSObject, ObservableObject {
                 self.heartbeatTimer?.cancel()
                 self.heartbeatTimer = nil
                 self.pageCreated = false
-                self.emitLog("[G2] 화면 절전 요청 (하트비트 정지)")
+                self.activeLayoutKey = nil
+                self.emitLog("[G2] 화면 절전 요청")
             } else if self.sessionReady {
                 self.recreatePageLocked(reason: "화면 깨우기")
             }
@@ -403,6 +566,10 @@ public final class G2BLEManager: NSObject, ObservableObject {
         stopTimers()
         sessionReady = false
         pageCreated = false
+        activeLayoutKey = nil
+        lastPushedTexts.removeAll()
+        uploadedImageHashes.removeAll()
+        imuActiveLocked = false
         handshakeStarted = false
         leftNotifyReady = false
         rightNotifyReady = false
@@ -428,11 +595,10 @@ public final class G2BLEManager: NSObject, ObservableObject {
         else { return }
         handshakeStarted = true
         setPhase(.handshaking)
-        emitLog("[G2] 양쪽 렌즈 GATT 준비 완료 → 인증 및 세션 시퀀스 시작")
+        emitLog("[G2] 양쪽 렌즈 GATT 준비 완료 → 인증 및 세션 초기화 시작")
 
         bleQueue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self else { return }
-            // 1. Auth Right, then Left (LIVE-CONFIRMED order)
             let rightAuth = G2Frame.authFrame(magic: self.nextAuthMagic())
             self.enqueue(side: .right, data: rightAuth)
 
@@ -441,21 +607,35 @@ public final class G2BLEManager: NSObject, ObservableObject {
                 let leftAuth = G2Frame.authFrame(magic: self.nextAuthMagic())
                 self.enqueue(side: .left, data: leftAuth)
 
-                // 2. Prelude on Right lens (SID 0x01)
                 self.bleQueue.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                     guard let self else { return }
                     self.enqueue(side: .right, data: G2Commands.preludeFrame)
 
-                    // 3. Connect housekeeping + Initial EvenHub page + Heartbeat
                     self.bleQueue.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                         guard let self else { return }
                         self.enqueueProtobuf(G2Commands.buildRoleChange(magic: self.nextMagic(), role: 1), sid: G2SID.deviceConfig, flag: G2Frame.flagRequest, side: .right)
                         self.enqueueProtobuf(G2Commands.buildTimeSync(magic: self.nextMagic()), sid: G2SID.deviceConfig, flag: G2Frame.flagRequest, side: .right)
                         self.enqueueProtobuf(G2Commands.buildOnboardingFinish(magic: self.nextMagic()), sid: G2SID.onboarding, flag: G2Frame.flagRequest, side: .right)
+                        self.enqueueProtobuf(G2Commands.buildDisplayTimeout(magic: self.nextMagic(), seconds: nil), sid: G2SID.moduleConfig, flag: G2Frame.flagRequest, side: .right)
+                        self.enqueueProtobuf(G2Commands.buildLanguage(magic: self.nextMagic(), index: 8), sid: G2SID.moduleConfig, flag: G2Frame.flagRequest, side: .right)
+
+                        if self.ancsEnabledLocked {
+                            self.enqueueProtobuf(G2Commands.buildNotificationCtrl(magic: self.nextMagic(), enable: true, autoDisplay: true, dispTime: 5), sid: G2SID.notification, flag: G2Frame.flagRequest, side: .right)
+                            self.enqueueProtobuf(G2Commands.buildWhitelistDisable(magic: self.nextMagic(), disable: true), sid: G2SID.notification, flag: G2Frame.flagRequest, side: .right)
+                        }
                         self.enqueueProtobuf(G2Commands.buildReadSettings(magic: self.nextMagic()), sid: G2SID.settings, flag: G2Frame.flagRequest, side: .right)
 
-                        let createPb = G2Commands.buildCreateInputPage(magic: self.nextMagic(), text: self.lastRenderedText)
+                        let createPb = G2Commands.buildCreatePage(magic: self.nextMagic(), page: self.lastRenderedPage)
                         self.enqueueProtobuf(createPb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+                        self.activeLayoutKey = self.lastRenderedPage.layoutKey
+                        self.lastPushedTexts = Dictionary(uniqueKeysWithValues: self.lastRenderedPage.textContainers.map { ($0.id, $0.text) })
+                        self.uploadedImageHashes.removeAll()
+                        self.enqueueImageUploadsLocked(self.lastRenderedPage.imageContainers)
+
+                        if self.imuDesiredLocked {
+                            self.imuActiveLocked = true
+                            self.enqueueProtobuf(G2Commands.buildImuControl(magic: self.nextMagic(), enable: true, reportFreqMs: 250), sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+                        }
 
                         self.pageCreated = true
                         self.screenAsleepLocked = false
@@ -466,7 +646,7 @@ public final class G2BLEManager: NSObject, ObservableObject {
                         self.setPhase(.connected)
                         self.startHeartbeatTimer()
                         self.startKeepaliveTimer()
-                        self.emitLog("[G2] 세션 연결 완료! (3.5초 하트비트 + 항시 OS 유지 활성)")
+                        self.emitLog("[G2] 세션 연결 완료! (3.5초 하트비트 + 항시 OS 유지 + ANCS 준비)")
                     }
                 }
             }
@@ -489,8 +669,18 @@ public final class G2BLEManager: NSObject, ObservableObject {
         DispatchQueue.main.async { self.isScreenAsleep = false }
 
         enqueue(side: .right, data: G2Commands.preludeFrame)
-        let createPb = G2Commands.buildCreateInputPage(magic: nextMagic(), text: lastRenderedText)
+        let createPb = G2Commands.buildCreatePage(magic: nextMagic(), page: lastRenderedPage)
         enqueueProtobuf(createPb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+
+        activeLayoutKey = lastRenderedPage.layoutKey
+        lastPushedTexts = Dictionary(uniqueKeysWithValues: lastRenderedPage.textContainers.map { ($0.id, $0.text) })
+        uploadedImageHashes.removeAll()
+        enqueueImageUploadsLocked(lastRenderedPage.imageContainers)
+
+        if imuDesiredLocked {
+            imuActiveLocked = true
+            enqueueProtobuf(G2Commands.buildImuControl(magic: nextMagic(), enable: true, reportFreqMs: 250), sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+        }
 
         pageCreated = true
         lastPageCreatedAt = Date()
@@ -503,12 +693,8 @@ public final class G2BLEManager: NSObject, ObservableObject {
 
     private func scheduleExitRecoveryLocked(eventLabel: String) {
         guard alwaysStayLocked, sessionReady, !screenAsleepLocked else { return }
-
         let now = Date()
-        // Ignore transient exit echoes immediately after we ourselves recreated the page.
-        if now.timeIntervalSince(lastPageCreatedAt) < 1.2 {
-            return
-        }
+        if now.timeIntervalSince(lastPageCreatedAt) < 1.2 { return }
 
         recentExitRecoveries = recentExitRecoveries.filter { now.timeIntervalSince($0) < 10.0 }
         let delay: TimeInterval = recentExitRecoveries.count >= 3 ? 2.0 : 0.35
@@ -532,7 +718,6 @@ public final class G2BLEManager: NSObject, ObservableObject {
             let now = Date()
             let gap = now.timeIntervalSince(self.lastHeartbeatSentAt)
 
-            // Check gap BEFORE updating lastHeartbeatSentAt so iOS suspension wakes recreate the page cleanly!
             if gap > 8.5 || !self.pageCreated {
                 self.recreatePageLocked(reason: String(format: "하트비트 공백(%.1f초) 감지 → OS 화면 자동 복구", gap))
                 return
@@ -606,8 +791,7 @@ public final class G2BLEManager: NSObject, ObservableObject {
             peripheral.writeValue(task.data, for: char, type: .withoutResponse)
         }
 
-        // 30ms pacing between BLE write-without-response packets keeps the firmware reassembly buffer healthy.
-        bleQueue.asyncAfter(deadline: .now() + 0.030) { [weak self] in
+        bleQueue.asyncAfter(deadline: .now() + 0.028) { [weak self] in
             guard let self else { return }
             self.isDrainingWrites = false
             self.drainWriteQueue()
@@ -770,12 +954,13 @@ extension G2BLEManager: CBCentralManagerDelegate {
         stopTimers()
         sessionReady = false
         pageCreated = false
+        activeLayoutKey = nil
+        imuActiveLocked = false
         handshakeStarted = false
         micEnabledLocked = false
 
         emitLog("[G2] \(lensSide.displayName) 연결 끊김 (\(error?.localizedDescription ?? "링크 해제"))")
 
-        // Automatically reconnect in the background unless the user explicitly tapped Disconnect.
         if !userInitiatedDisconnect {
             setPhase(.connecting)
             emitLog("[G2] 백그라운드 자동 재연결 대기 중...")
@@ -838,7 +1023,6 @@ extension G2BLEManager: CBPeripheralDelegate {
         // 1. Raw LC3 Microphone stream (0x6402)
         if characteristic.uuid == G2Constants.charAudioNotify {
             guard let mic = G2MicPacket.parse(data) else { return }
-            // Prefer Left lens for recording to avoid duplicating frames if both lenses emit.
             if lensSide == .left || !leftConnected {
                 micRecordingData.append(mic.rawAudioBytes)
                 DispatchQueue.main.async {
@@ -861,9 +1045,14 @@ extension G2BLEManager: CBPeripheralDelegate {
         switch frame.sid {
         case G2SID.evenHub:
             if let event = G2Commands.decodeDeviceEvent(frame.payload) {
+                if event.eventType == .imuData, let imu = event.imu {
+                    DispatchQueue.main.async { self.onImuSample?(imu) }
+                    return
+                }
                 switch event.eventType {
                 case .foregroundExit, .abnormalExit, .systemExit:
                     self.pageCreated = false
+                    self.activeLayoutKey = nil
                     self.emitLog("[G2] 세션 이탈 이벤트: \(event.eventType.label)")
                     self.scheduleExitRecoveryLocked(eventLabel: event.eventType.label)
                 default:
@@ -878,6 +1067,12 @@ extension G2BLEManager: CBPeripheralDelegate {
                     if let c = readback.charging { self.isCharging = c }
                     if let s = readback.silentMode { self.silentMode = s }
                     if let br = readback.brightnessLevel { self.brightnessLevel = br }
+                    if let autoB = readback.brightnessAuto { self.brightnessAuto = autoB }
+                    if let h = readback.displayHeight { self.displayHeight = h }
+                    if let d = readback.displayDistance { self.displayDistance = d }
+                    if let hu = readback.headUpEnabled { self.headUpEnabled = hu }
+                    if let ha = readback.headUpAngle { self.headUpAngle = ha }
+                    if let w = readback.wearDetection { self.wearDetection = w }
                     if let l = readback.leftFirmware { self.firmwareLeft = l }
                     if let r = readback.rightFirmware { self.firmwareRight = r }
                 }

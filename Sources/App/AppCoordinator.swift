@@ -3,7 +3,8 @@ import Foundation
 import UIKit
 
 /// Central singleton coordinating G2 BLE, Always-On OS protection, Flic Duo,
-/// fullscreen Motion Pad inputs, and the G2 mini OS.
+/// fullscreen Motion Pad inputs, live data services (Weather, Calendar/QuickList, Pedometer, Alarm/Timer),
+/// and the G2 OS state machine.
 public final class AppCoordinator: ObservableObject {
     public static let shared = AppCoordinator()
 
@@ -11,6 +12,12 @@ public final class AppCoordinator: ObservableObject {
     public let flic = FlicDuoDriver()
     public let os = G2OSStateMachine()
     public let backgroundKeeper = BackgroundKeeper()
+
+    // Live $0 free iOS data services
+    public let weather = WeatherService()
+    public let calendar = CalendarQuickListService()
+    public let pedometer = PedometerService()
+    public let clockTools = AlarmTimerService()
 
     @Published public private(set) var logs: [String] = []
     @Published public var keepAliveEnabled: Bool = true {
@@ -47,15 +54,13 @@ public final class AppCoordinator: ObservableObject {
         }
     }
 
-    /// Safe to call multiple times; executes initialization exactly once on launch.
     public func bootstrap() {
         guard !bootstrapped else { return }
         bootstrapped = true
-        appendLog("[SYS] G2 OS 시작")
+        appendLog("[SYS] G2 OS v0.3 시작")
 
         flic.configure()
 
-        // Always-On protection defaults to ON so the glasses never fall back to stock OS.
         let saved: Bool
         if UserDefaults.standard.object(forKey: Self.keepAliveKey) == nil {
             saved = true
@@ -66,20 +71,58 @@ public final class AppCoordinator: ObservableObject {
         backgroundKeeper.setEnabled(saved)
         ble.setAlwaysStayInCustomOS(saved)
         os.alwaysOnEnabled = saved
+
+        // Start free live services
+        weather.start()
+        calendar.start()
+        pedometer.start()
+        clockTools.start()
+        syncAllServicesToOS(push: false)
     }
 
     public func triggerMotionAction(_ action: RemoteAction, detail: String = "") {
         playHaptic(for: action)
         os.handle(RemoteCommandEvent(action: action, source: .motionPad, detail: detail))
+        updateImuStreamingNeed()
     }
 
     public func triggerVirtualAction(_ action: RemoteAction, detail: String = "") {
         playHaptic(for: action)
         os.handle(RemoteCommandEvent(action: action, source: .virtualPad, detail: detail))
+        updateImuStreamingNeed()
     }
 
     public func clearLogs() {
         DispatchQueue.main.async { self.logs.removeAll() }
+    }
+
+    public func refreshAllData() {
+        weather.requestLocationAndRefresh()
+        calendar.refresh()
+        ble.querySettings()
+        syncAllServicesToOS(push: true)
+    }
+
+    private func updateImuStreamingNeed() {
+        let needsImu = os.headUpWakeEnabled || os.currentScreen == .headUp
+        ble.setImuStreaming(needsImu, reportFreqMs: 250)
+    }
+
+    private func syncAllServicesToOS(push: Bool) {
+        os.weather = weather.snapshot
+        os.calendarEvents = calendar.upcomingEvents
+        os.quickTasks = calendar.tasks
+        os.todaySteps = pedometer.todaySteps
+        os.todayDistanceKm = pedometer.formattedDistanceKm
+        os.alarms = clockTools.alarms
+        os.nextAlarm = clockTools.nextEnabledAlarm
+        os.timerRemainingSeconds = clockTools.timerRemainingSeconds
+        os.isTimerRunning = clockTools.isTimerRunning
+        os.stopwatchSeconds = clockTools.stopwatchSeconds
+        os.isStopwatchRunning = clockTools.isStopwatchRunning
+        os.stopwatchLaps = clockTools.stopwatchLaps
+        os.activeAlert = clockTools.activeAlert
+        os.refreshDisplay(pushToGlasses: push)
     }
 
     private func playHaptic(for action: RemoteAction) {
@@ -108,6 +151,7 @@ public final class AppCoordinator: ObservableObject {
                 guard let self else { return }
                 self.backgroundKeeper.ensureRunning()
                 self.ble.ensureScreenActive(forceRecreate: false)
+                self.calendar.refresh()
             }
         )
         observers.append(
@@ -116,8 +160,7 @@ public final class AppCoordinator: ObservableObject {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                guard let self else { return }
-                self.backgroundKeeper.ensureRunning()
+                self?.backgroundKeeper.ensureRunning()
             }
         )
     }
@@ -132,9 +175,15 @@ public final class AppCoordinator: ObservableObject {
             guard let self else { return }
             self.appendLog("[Flic] \(event.detail) → \(event.action.rawValue)")
             self.os.handle(event)
+            self.updateImuStreamingNeed()
         }
 
-        // Forward G2 temple touch events -> OS (ignore system exit notifications already handled by BLE guard)
+        // Forward G2 IMU stream -> Head-Up Wake detector
+        ble.onImuSample = { [weak self] sample in
+            self?.os.handleImuSample(sample)
+        }
+
+        // Forward G2 temple touch events -> OS
         ble.onGlassesEvent = { [weak self] devEvent in
             guard let self else { return }
             let mapped: RemoteAction?
@@ -149,10 +198,11 @@ public final class AppCoordinator: ObservableObject {
             }
             if let mapped {
                 self.os.handle(RemoteCommandEvent(action: mapped, source: .glassesTemple, detail: devEvent.eventType.label))
+                self.updateImuStreamingNeed()
             }
         }
 
-        // Mic packet telemetry -> throttled live G2 HUD refresh while Push-to-Talk mic is open
+        // Mic packet telemetry -> throttled live G2 HUD refresh
         ble.onMicPacket = { [weak self] packet in
             guard let self else { return }
             self.os.micPackets = self.ble.micPacketCount
@@ -167,9 +217,38 @@ public final class AppCoordinator: ObservableObject {
             }
         }
 
-        // Outbound OS actions -> G2 hardware & Flic Duo buzzer
-        os.onRenderChanged = { [weak self] text in
-            self?.ble.renderScreenText(text)
+        // Service updates -> OS live refresh
+        weather.onUpdate = { [weak self] _ in
+            guard let self else { return }
+            self.syncAllServicesToOS(push: self.os.currentScreen == .dashboard)
+        }
+        calendar.onChanged = { [weak self] in
+            guard let self else { return }
+            let push = (self.os.currentScreen == .dashboard || self.os.currentScreen == .quickList)
+            self.syncAllServicesToOS(push: push)
+        }
+        pedometer.onUpdate = { [weak self] in
+            guard let self else { return }
+            self.syncAllServicesToOS(push: self.os.currentScreen == .dashboard)
+        }
+        clockTools.onTick = { [weak self] in
+            guard let self else { return }
+            let push = (self.os.currentScreen == .clockTools || self.os.currentScreen == .dashboard || self.clockTools.activeAlert != nil)
+            self.syncAllServicesToOS(push: push)
+        }
+        clockTools.onAlertStarted = { [weak self] alert in
+            guard let self else { return }
+            self.appendLog("[알림] \(alert.kind.rawValue): \(alert.title)")
+            self.flic.testBuzzer()
+            self.syncAllServicesToOS(push: true)
+        }
+        clockTools.onAlertDismissed = { [weak self] in
+            self?.syncAllServicesToOS(push: true)
+        }
+
+        // Outbound OS actions -> Hardware & Services
+        os.onPageChanged = { [weak self] page in
+            self?.ble.renderPage(page)
         }
         os.onToggleMic = { [weak self] enabled in
             guard let self else { return }
@@ -182,28 +261,35 @@ public final class AppCoordinator: ObservableObject {
                 DispatchQueue.main.async { self.lastSavedRecordingPath = url.lastPathComponent }
             }
         }
-        os.onSetBrightness = { [weak self] level in
-            self?.ble.setBrightness(level)
-        }
-        os.onSetSilentMode = { [weak self] enabled in
-            self?.ble.setSilentMode(enabled)
-        }
-        os.onQuerySettings = { [weak self] in
-            self?.ble.querySettings()
-        }
-        os.onSetScreenAsleep = { [weak self] asleep in
-            self?.ble.setScreenAsleep(asleep)
-        }
+        os.onSetBrightness = { [weak self] level in self?.ble.setBrightness(level) }
+        os.onSetAutoBrightness = { [weak self] on in self?.ble.setAutoBrightness(on) }
+        os.onSetDisplayHeight = { [weak self] h in self?.ble.setDisplayHeight(h) }
+        os.onSetDisplayDistance = { [weak self] d in self?.ble.setDisplayDistance(d) }
+        os.onSetHeadUpConfig = { [weak self] on, angle in self?.ble.setHeadUp(enabled: on, angle: angle) }
+        os.onSetWearDetection = { [weak self] on in self?.ble.setWearDetection(on) }
+        os.onSetSilentMode = { [weak self] on in self?.ble.setSilentMode(on) }
+        os.onSetAncsEnabled = { [weak self] on in self?.ble.setAncsNotifications(enabled: on) }
+        os.onQuerySettings = { [weak self] in self?.ble.querySettings() }
+        os.onSetScreenAsleep = { [weak self] asleep in self?.ble.setScreenAsleep(asleep) }
+        os.onRefreshDataServices = { [weak self] in self?.refreshAllData() }
+        os.onToggleQuickTask = { [weak self] id in self?.calendar.toggleTask(id: id) }
+        os.onToggleAlarm = { [weak self] id in self?.clockTools.toggleAlarm(id: id) }
+        os.onSetTimerPreset = { [weak self] secs in self?.clockTools.setTimerDuration(seconds: secs) }
+        os.onToggleTimer = { [weak self] in self?.clockTools.toggleTimer() }
+        os.onResetTimer = { [weak self] in self?.clockTools.resetTimer() }
+        os.onToggleStopwatch = { [weak self] in self?.clockTools.toggleStopwatch() }
+        os.onLapStopwatch = { [weak self] in self?.clockTools.lapStopwatch() }
+        os.onResetStopwatch = { [weak self] in self?.clockTools.resetStopwatch() }
+        os.onDismissAlert = { [weak self] in self?.clockTools.dismissActiveAlert() }
+        os.onSnoozeAlert = { [weak self] in self?.clockTools.snoozeActiveAlert(minutes: 5) }
 
-        // Sync BLE telemetry to OS state
+        // Sync BLE hardware readback -> OS state
         ble.$batteryLevel
             .receive(on: DispatchQueue.main)
             .sink { [weak self] val in
                 guard let self else { return }
                 self.os.g2Battery = val
-                if self.os.currentScreen == .home || self.os.currentScreen == .briefing {
-                    self.os.refreshDisplay(pushToGlasses: true)
-                }
+                if self.os.currentScreen == .dashboard { self.os.refreshDisplay(pushToGlasses: true) }
             }
             .store(in: &cancellables)
 
@@ -217,16 +303,47 @@ public final class AppCoordinator: ObservableObject {
             .sink { [weak self] val in self?.os.brightness = val }
             .store(in: &cancellables)
 
+        ble.$brightnessAuto
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] val in self?.os.autoBrightness = val }
+            .store(in: &cancellables)
+
+        ble.$displayHeight
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] val in self?.os.displayHeight = val }
+            .store(in: &cancellables)
+
+        ble.$displayDistance
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] val in self?.os.displayDistance = val }
+            .store(in: &cancellables)
+
+        ble.$wearDetection
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] val in self?.os.wearDetection = val }
+            .store(in: &cancellables)
+
         ble.$silentMode
             .receive(on: DispatchQueue.main)
             .sink { [weak self] val in self?.os.silentMode = val }
+            .store(in: &cancellables)
+
+        ble.$firmwareLeft
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] val in self?.os.g2FirmwareLeft = val }
+            .store(in: &cancellables)
+
+        ble.$firmwareRight
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] val in self?.os.g2FirmwareRight = val }
             .store(in: &cancellables)
 
         ble.$phase
             .receive(on: DispatchQueue.main)
             .sink { [weak self] phase in
                 if phase == .connected {
-                    self?.os.refreshDisplay(pushToGlasses: true)
+                    self?.syncAllServicesToOS(push: true)
+                    self?.updateImuStreamingNeed()
                 }
             }
             .store(in: &cancellables)
