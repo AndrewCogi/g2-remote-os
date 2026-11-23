@@ -1,16 +1,15 @@
 import Foundation
 
-/// Self-contained mini OS rendered onto the G2 576x288 EvenHub canvas.
-/// Every screen supports full directional control (Up/Down/Left/Right), scrolling,
-/// selection/back/home, and global G2 microphone toggle from any screen.
+/// Clean, self-contained G2 OS rendered onto the 576x288 monochrome EvenHub canvas.
+/// Built from a crisp 2x2 Home Launcher with global Push-to-Talk microphone HUD
+/// and Always-On protection (never accidentally drops back to the stock G2 OS).
 public final class G2OSStateMachine: ObservableObject {
     public enum Screen: String, CaseIterable {
-        case home = "홈 런처"
-        case dashboard = "대시보드"
-        case reader = "스크롤 리더"
-        case mic = "G2 마이크"
-        case dpadTest = "4방향 테스트"
-        case settings = "기기 설정"
+        case home = "홈"
+        case agent = "AI 에이전트"
+        case reader = "메모 리더"
+        case briefing = "오늘 브리핑"
+        case settings = "시스템 설정"
     }
 
     public struct ReaderDocument: Identifiable, Equatable {
@@ -23,50 +22,40 @@ public final class G2OSStateMachine: ObservableObject {
     @Published public private(set) var renderedFrameText: String = ""
     @Published public private(set) var lastActionSummary: String = "대기 중"
     @Published public private(set) var recentActions: [String] = []
+    @Published public private(set) var toastMessage: String?
 
-    // Home 2x3 grid cursor (col: 0..1, row: 0..2)
+    // Home 2x2 launcher cursor (row: 0..1, col: 0..1)
     @Published public private(set) var homeRow: Int = 0
     @Published public private(set) var homeCol: Int = 0
 
-    // Dashboard page (0..2)
-    @Published public private(set) var dashboardPage: Int = 0
+    // AI Agent / Push-to-Talk history summary
+    @Published public private(set) var lastVoiceSummary: String = "아직 음성 입력 없음"
 
-    // Scroll reader state
+    // Memo / Scroll Reader documents
     @Published public var documents: [ReaderDocument] = [
         ReaderDocument(
             id: 0,
-            title: "발표 대본 (테스트)",
+            title: "시작 가이드",
             lines: [
-                "1. 안녕하세요. Even G2 커스텀 OS 테스트입니다.",
-                "2. 지금 이 화면은 아이폰이 화면 꺼짐 상태에서도",
-                "3. Flic Duo 리모콘으로 실시간 제어됩니다.",
-                "4. 큰 버튼 클릭은 선택, 더블클릭은 뒤로가기,",
-                "5. 큰 버튼 길게 누르기는 G2 마이크 On/Off입니다.",
-                "6. 작은 버튼 클릭은 아래로, 더블클릭은 위로,",
-                "7. 스와이프는 상하좌우 4방향 이동입니다.",
-                "8. 큰 버튼을 누른 채 손목을 비틀면(Twist)",
-                "9. 이렇게 문서를 부드럽게 스크롤할 수 있습니다.",
-                "10. 좌/우 방향키로 다른 문서로 전환해 보세요.",
-                "11. 확인 버튼을 누르면 자동 스크롤이 토글됩니다.",
-                "12. --- 문서 끝 (맨 아래 도달) ---"
+                "1. G2 OS에 오신 것을 환영합니다.",
+                "2. 화면 전체가 모션 패드로 동작합니다.",
+                "3. 상·하·좌·우 스와이프로 이동하고,",
+                "4. 한 번 탭하면 선택, 두 번 탭하면 뒤로,",
+                "5. 길게 누르면 G2 마이크가 열립니다.",
+                "6. 손을 떼면 마이크가 즉시 닫힙니다.",
+                "7. 설정에서 나만의 메모를 추가하면",
+                "8. 좌/우 스와이프로 전환해 읽을 수 있습니다."
             ]
         ),
         ReaderDocument(
             id: 1,
-            title: "Flic Duo 조작법",
+            title: "내 메모",
             lines: [
-                "[큰 버튼 (Button 0)]",
-                " - 클릭: 확인 / 선택",
-                " - 더블클릭: 뒤로가기",
-                " - 홀드: G2 내장 마이크 On/Off",
-                " - 누르고 비틀기: 연속 스크롤 ↑↓",
-                " - 누르고 스와이프: 상/하/좌/우 이동",
+                "설정 > 메모 편집에서 내용을 수정하면",
+                "이 화면에 바로 반영됩니다.",
                 "",
-                "[작은 버튼 (Button 1)]",
-                " - 클릭: 아래 / 다음 항목",
-                " - 더블클릭: 위 / 이전 항목",
-                " - 홀드: 홈 런처 (홈에선 절전)",
-                " - 누르고 비틀기: G2 밝기 조절"
+                "위/아래 스와이프로 스크롤하고,",
+                "한 번 탭하면 자동 스크롤이 켜집니다."
             ]
         )
     ]
@@ -74,17 +63,16 @@ public final class G2OSStateMachine: ObservableObject {
     @Published public private(set) var readerScrollOffset: Int = 0
     @Published public private(set) var readerAutoScroll: Bool = false
 
-    // 4-way D-pad & scroll test cursor
-    @Published public private(set) var padX: Int = 5 // 0..10
-    @Published public private(set) var padY: Int = 2 // 0..4
-    @Published public private(set) var padScrollValue: Int = 0
-
-    // Settings menu index (0..3)
+    // Settings cursor (0..2)
     @Published public private(set) var settingsIndex: Int = 0
 
     // Telemetry mirror injected from BLE/Flic managers
     public var g2Battery: Int?
+    public var g2Charging: Bool = false
+    public var g2Firmware: String = "-"
+    public var flicConnected: Bool = false
     public var flicVoltage: Float = 0
+    public var alwaysOnEnabled: Bool = true
     public var isMicOn: Bool = false
     public var micPackets: Int = 0
     public var micDurationMs: Int = 0
@@ -105,12 +93,12 @@ public final class G2OSStateMachine: ObservableObject {
 
     private var autoScrollTimer: Timer?
     private var clockTimer: Timer?
+    private var toastClearWorkItem: DispatchWorkItem?
     private var lastClockMinute: String = ""
 
-    private let homeGrid: [[(label: String, target: Screen?)]] = [
-        [("1.대시보드", .dashboard), ("2.스크롤리더", .reader)],
-        [("3.G2마이크", .mic), ("4.4방향패드", .dpadTest)],
-        [("5.기기설정", .settings), ("6.화면절전", nil)]
+    private let homeGrid: [[(label: String, target: Screen)]] = [
+        [("AI 에이전트", .agent), ("메모 리더", .reader)],
+        [("오늘 브리핑", .briefing), ("시스템 설정", .settings)]
     ]
 
     public init() {
@@ -121,15 +109,14 @@ public final class G2OSStateMachine: ObservableObject {
     deinit {
         autoScrollTimer?.invalidate()
         clockTimer?.invalidate()
+        toastClearWorkItem?.cancel()
     }
 
     private func startClockTick() {
         clockTimer?.invalidate()
-        clockTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
+        clockTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { [weak self] _ in
             guard let self, !self.isScreenAsleep else { return }
-            let fmt = DateFormatter()
-            fmt.dateFormat = "HH:mm"
-            let nowMin = fmt.string(from: Date())
+            let nowMin = self.formattedClock()
             if nowMin != self.lastClockMinute {
                 self.lastClockMinute = nowMin
                 self.rebuildDisplay(pushToGlasses: true)
@@ -142,12 +129,14 @@ public final class G2OSStateMachine: ObservableObject {
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .newlines) }
         let safeLines = lines.isEmpty ? ["(내용 없음)"] : lines
-        if documents.count >= 3 {
-            documents[2] = ReaderDocument(id: 2, title: title.isEmpty ? "사용자 메모" : title, lines: safeLines)
+        let doc = ReaderDocument(id: 1, title: title.isEmpty ? "내 메모" : title, lines: safeLines)
+        if documents.count >= 2 {
+            documents[1] = doc
         } else {
-            documents.append(ReaderDocument(id: 2, title: title.isEmpty ? "사용자 메모" : title, lines: safeLines))
+            documents.append(doc)
         }
         if currentScreen == .reader {
+            readerScrollOffset = 0
             rebuildDisplay()
         }
     }
@@ -156,9 +145,9 @@ public final class G2OSStateMachine: ObservableObject {
         let entry = "[\(event.source.rawValue)] \(event.action.rawValue)" + (event.detail.isEmpty ? "" : " (\(event.detail))")
         lastActionSummary = entry
         recentActions.insert(entry, at: 0)
-        if recentActions.count > 8 { recentActions.removeLast() }
+        if recentActions.count > 10 { recentActions.removeLast() }
 
-        // If screen is asleep, any button wakes the G2 display immediately.
+        // If asleep, any input wakes our OS immediately.
         if isScreenAsleep && event.action != .screenToggle {
             isScreenAsleep = false
             onSetScreenAsleep?(false)
@@ -166,103 +155,142 @@ public final class G2OSStateMachine: ObservableObject {
             return
         }
 
-        // Global shortcuts that work on every screen
+        // Global Push-to-Talk & system actions (available on every screen)
         switch event.action {
+        case .micStart:
+            setMicActive(true)
+            return
+        case .micStop:
+            setMicActive(false)
+            return
         case .micToggle:
-            let next = !isMicOn
-            isMicOn = next
-            onToggleMic?(next)
-            rebuildDisplay()
+            setMicActive(!isMicOn)
             return
         case .brightnessUp:
             brightness = min(50, brightness + 5)
             onSetBrightness?(brightness)
+            showToast("밝기 \(brightness)/50")
             rebuildDisplay()
             return
         case .brightnessDown:
             brightness = max(1, brightness - 5)
             onSetBrightness?(brightness)
+            showToast("밝기 \(brightness)/50")
             rebuildDisplay()
             return
         case .screenToggle:
-            isScreenAsleep.toggle()
-            onSetScreenAsleep?(isScreenAsleep)
-            if !isScreenAsleep { rebuildDisplay() }
+            if alwaysOnEnabled {
+                showToast("항시 OS 유지 활성화됨")
+                rebuildDisplay()
+            } else {
+                isScreenAsleep.toggle()
+                onSetScreenAsleep?(isScreenAsleep)
+                if !isScreenAsleep { rebuildDisplay() }
+            }
             return
         case .home:
             stopAutoScroll()
-            if currentScreen == .home {
-                isScreenAsleep = true
-                onSetScreenAsleep?(true)
-            } else {
-                currentScreen = .home
-                rebuildDisplay()
-            }
+            currentScreen = .home
+            rebuildDisplay()
             return
         default:
             break
         }
 
-        // Screen-specific navigation
+        // While Push-to-Talk mic is actively open, ignore accidental navigation inputs.
+        if isMicOn {
+            return
+        }
+
+        // Per-screen navigation
         switch currentScreen {
         case .home:
             handleHome(event.action)
-        case .dashboard:
-            handleDashboard(event.action)
+        case .agent:
+            handleAgent(event.action)
         case .reader:
             handleReader(event.action)
-        case .mic:
-            handleMic(event.action)
-        case .dpadTest:
-            handleDpadTest(event.action)
+        case .briefing:
+            handleBriefing(event.action)
         case .settings:
             handleSettings(event.action)
         }
         rebuildDisplay()
     }
 
-    /// Re-renders the current G2 text frame (e.g. when battery or mic telemetry updates).
+    /// Re-renders the current G2 canvas frame (e.g. when battery or mic telemetry updates).
     public func refreshDisplay(pushToGlasses: Bool = true) {
         rebuildDisplay(pushToGlasses: pushToGlasses)
+    }
+
+    // MARK: - Push-to-Talk Mic Handling
+
+    private func setMicActive(_ enabled: Bool) {
+        guard enabled != isMicOn else { return }
+        if enabled {
+            isMicOn = true
+            micPackets = 0
+            micDurationMs = 0
+            micSignal = 0
+            onToggleMic?(true)
+            rebuildDisplay()
+        } else {
+            let capturedPackets = micPackets
+            let capturedSec = Double(micDurationMs) / 1000.0
+            isMicOn = false
+            onToggleMic?(false)
+            if capturedPackets > 0 {
+                onSaveMicRecording?()
+                let summary = String(format: "최근 음성 %.1f초 (%d pkt)", capturedSec, capturedPackets)
+                lastVoiceSummary = summary
+                showToast(String(format: "음성 수집 완료 (%.1f초)", capturedSec))
+            } else {
+                showToast("마이크 닫힘")
+            }
+            rebuildDisplay()
+        }
+    }
+
+    private func showToast(_ message: String, duration: TimeInterval = 3.0) {
+        toastMessage = message
+        toastClearWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.toastMessage = nil
+            if !self.isMicOn && !self.isScreenAsleep {
+                self.rebuildDisplay(pushToGlasses: true)
+            }
+        }
+        toastClearWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
     }
 
     // MARK: - Per-Screen Handlers
 
     private func handleHome(_ action: RemoteAction) {
         switch action {
-        case .up, .scrollUp:
-            homeRow = (homeRow + 2) % 3
-        case .down, .scrollDown:
-            homeRow = (homeRow + 1) % 3
-        case .left:
-            homeCol = (homeCol + 1) % 2
-        case .right:
+        case .up, .scrollUp, .down, .scrollDown:
+            homeRow = (homeRow + 1) % 2
+        case .left, .right:
             homeCol = (homeCol + 1) % 2
         case .select:
-            let item = homeGrid[homeRow][homeCol]
-            if let target = item.target {
-                currentScreen = target
-                if target == .settings { onQuerySettings?() }
-            } else {
-                isScreenAsleep = true
-                onSetScreenAsleep?(true)
+            let target = homeGrid[homeRow][homeCol].target
+            currentScreen = target
+            if target == .briefing || target == .settings {
+                onQuerySettings?()
             }
         case .back:
-            isScreenAsleep = true
-            onSetScreenAsleep?(true)
+            // Stay cleanly on Home — never sleep or exit to the stock G2 OS.
+            break
         default:
             break
         }
     }
 
-    private func handleDashboard(_ action: RemoteAction) {
+    private func handleAgent(_ action: RemoteAction) {
         switch action {
-        case .left, .up, .scrollUp:
-            dashboardPage = (dashboardPage + 2) % 3
-        case .right, .down, .scrollDown:
-            dashboardPage = (dashboardPage + 1) % 3
         case .select:
-            onQuerySettings?()
+            showToast("길게 눌러 G2 마이크로 말하세요")
         case .back:
             currentScreen = .home
         default:
@@ -272,7 +300,7 @@ public final class G2OSStateMachine: ObservableObject {
 
     private func handleReader(_ action: RemoteAction) {
         let lines = currentDocument.lines
-        let visibleLines = 5
+        let visibleLines = 4
         let maxOffset = max(0, lines.count - visibleLines)
 
         switch action {
@@ -298,37 +326,11 @@ public final class G2OSStateMachine: ObservableObject {
         }
     }
 
-    private func handleMic(_ action: RemoteAction) {
+    private func handleBriefing(_ action: RemoteAction) {
         switch action {
-        case .select, .up, .down:
-            let next = !isMicOn
-            isMicOn = next
-            onToggleMic?(next)
-        case .right:
-            onSaveMicRecording?()
-        case .back, .left:
-            currentScreen = .home
-        default:
-            break
-        }
-    }
-
-    private func handleDpadTest(_ action: RemoteAction) {
-        switch action {
-        case .up:
-            padY = max(0, padY - 1)
-        case .down:
-            padY = min(4, padY + 1)
-        case .left:
-            padX = max(0, padX - 1)
-        case .right:
-            padX = min(10, padX + 1)
-        case .scrollUp:
-            padScrollValue = min(100, padScrollValue + 5)
-        case .scrollDown:
-            padScrollValue = max(-100, padScrollValue - 5)
         case .select:
-            padX = 5; padY = 2; padScrollValue = 0
+            onQuerySettings?()
+            showToast("기기 상태 새로고침")
         case .back:
             currentScreen = .home
         default:
@@ -339,9 +341,9 @@ public final class G2OSStateMachine: ObservableObject {
     private func handleSettings(_ action: RemoteAction) {
         switch action {
         case .up, .scrollUp:
-            settingsIndex = (settingsIndex + 3) % 4
+            settingsIndex = (settingsIndex + 2) % 3
         case .down, .scrollDown:
-            settingsIndex = (settingsIndex + 1) % 4
+            settingsIndex = (settingsIndex + 1) % 3
         case .left:
             if settingsIndex == 0 {
                 brightness = max(1, brightness - 5)
@@ -368,9 +370,7 @@ public final class G2OSStateMachine: ObservableObject {
                 onSetSilentMode?(silentMode)
             case 2:
                 onQuerySettings?()
-            case 3:
-                isScreenAsleep = true
-                onSetScreenAsleep?(true)
+                showToast("상태 조회 요청")
             default:
                 break
             }
@@ -381,7 +381,7 @@ public final class G2OSStateMachine: ObservableObject {
         }
     }
 
-    // MARK: - Auto-scroll helper
+    // MARK: - Auto-Scroll Helper
 
     private func toggleAutoScroll() {
         if readerAutoScroll {
@@ -394,7 +394,7 @@ public final class G2OSStateMachine: ObservableObject {
                     self?.stopAutoScroll()
                     return
                 }
-                let maxOffset = max(0, self.currentDocument.lines.count - 5)
+                let maxOffset = max(0, self.currentDocument.lines.count - 4)
                 if self.readerScrollOffset < maxOffset {
                     self.readerScrollOffset += 1
                 } else {
@@ -415,18 +415,21 @@ public final class G2OSStateMachine: ObservableObject {
         documents[max(0, min(documents.count - 1, readerDocIndex))]
     }
 
-    // MARK: - G2 576x288 Monochrome Canvas Renderer (~40 cols x 9 rows)
+    // MARK: - G2 576x288 Monochrome Canvas Renderer
 
     private func rebuildDisplay(pushToGlasses: Bool = true) {
         let header = renderHeader()
         let body: String
-        switch currentScreen {
-        case .home: body = renderHome()
-        case .dashboard: body = renderDashboard()
-        case .reader: body = renderReader()
-        case .mic: body = renderMic()
-        case .dpadTest: body = renderDpadTest()
-        case .settings: body = renderSettings()
+        if isMicOn {
+            body = renderMicOverlay()
+        } else {
+            switch currentScreen {
+            case .home: body = renderHome()
+            case .agent: body = renderAgent()
+            case .reader: body = renderReader()
+            case .briefing: body = renderBriefing()
+            case .settings: body = renderSettings()
+            }
         }
         let full = "\(header)\n\(body)"
         renderedFrameText = full
@@ -435,113 +438,119 @@ public final class G2OSStateMachine: ObservableObject {
         }
     }
 
-    private func renderHeader() -> String {
+    private func formattedClock() -> String {
         let fmt = DateFormatter()
         fmt.dateFormat = "HH:mm"
-        let timeStr = fmt.string(from: Date())
-        let batStr = g2Battery.map { "\($0)%" } ?? "--%"
-        let micTag = isMicOn ? " [●MIC]" : ""
-        return "\(timeStr) | \(currentScreen.rawValue) | \(batStr)\(micTag)\n----------------------------------------"
+        return fmt.string(from: Date())
+    }
+
+    private func formattedShortDate() -> String {
+        let df = DateFormatter()
+        df.dateFormat = "M/d (E)"
+        df.locale = Locale(identifier: "ko_KR")
+        return df.string(from: Date())
+    }
+
+    private func renderHeader() -> String {
+        let timeStr = formattedClock()
+        lastClockMinute = timeStr
+        let batStr = g2Battery.map { "\(g2Charging ? "+" : "")\($0)%" } ?? "--%"
+        let center: String
+        if isMicOn {
+            center = "● MIC 듣는 중"
+        } else if currentScreen == .home {
+            center = formattedShortDate()
+        } else {
+            center = currentScreen.rawValue
+        }
+        return "\(timeStr)   \(center)   \(batStr)\n──────────────────────────"
     }
 
     private func renderHome() -> String {
-        var rows: [String] = []
-        for r in 0..<3 {
-            let left = homeGrid[r][0].label
-            let right = homeGrid[r][1].label
-            let lCell = (homeRow == r && homeCol == 0) ? "▶[\(left)]" : "  \(left) "
-            let rCell = (homeRow == r && homeCol == 1) ? "▶[\(right)]" : "  \(right) "
-            rows.append("\(lCell)    \(rCell)")
+        func cell(_ r: Int, _ c: Int) -> String {
+            let label = homeGrid[r][c].label
+            return (homeRow == r && homeCol == c) ? "▶ [\(label)]" : "   \(label) "
         }
-        rows.append("")
-        rows.append("방향:상하좌우 | 클릭:선택 | 홀드:마이크")
-        return rows.joined(separator: "\n")
+
+        let statusLine = toastMessage.map { "  · \($0)" } ?? "  G2 OS"
+        return [
+            statusLine,
+            "",
+            "\(cell(0, 0))   \(cell(0, 1))",
+            "\(cell(1, 0))   \(cell(1, 1))",
+            "",
+            "스와이프 이동 · 탭 선택 · 홀드 마이크"
+        ].joined(separator: "\n")
     }
 
-    private func renderDashboard() -> String {
-        let flicStr = flicVoltage > 0 ? String(format: "%.2fV", flicVoltage) : "미연결"
-        switch dashboardPage {
-        case 0:
-            let df = DateFormatter()
-            df.dateFormat = "yyyy-MM-dd (E)"
-            df.locale = Locale(identifier: "ko_KR")
-            return [
-                "날짜: \(df.string(from: Date()))",
-                "G2 배터리: \(g2Battery.map { "\($0)%" } ?? "조회중") | 밝기: \(brightness)/50",
-                "Flic 배터리: \(flicStr) | 무음: \(silentMode ? "ON" : "OFF")",
-                "마이크: \(isMicOn ? "녹음중 (\(micPackets) pkt)" : "대기")",
-                "",
-                "[1/3] ◀ 좌/우로 페이지 전환 ▶"
-            ].joined(separator: "\n")
-        case 1:
-            return [
-                "[Flic Duo 퀵 가이드]",
-                "큰버튼: 클릭=선택 / 더블=뒤로 / 홀드=마이크",
-                "작은버튼: 클릭=↓ / 더블=↑ / 홀드=홈",
-                "스와이프: ↑↓←→ | Twist: 연속스크롤",
-                "",
-                "[2/3] ◀ 좌/우로 페이지 전환 ▶"
-            ].joined(separator: "\n")
-        default:
-            let recent = recentActions.prefix(4).map { "- \($0)" }
-            let list = recent.isEmpty ? ["(아직 입력 없음)"] : Array(recent)
-            return ([ "[최근 리모콘 입력]" ] + list + [ "[3/3] ◀ 좌/우 ▶ | 뒤로=홈" ]).joined(separator: "\n")
-        }
+    private func renderMicOverlay() -> String {
+        let sec = Double(micDurationMs) / 1000.0
+        let levelNorm = max(0, min(10, Int(abs(Int(micSignal))) / 280))
+        let bar = String(repeating: "█", count: levelNorm) + String(repeating: "░", count: 10 - levelNorm)
+        let secText = String(format: "%.1f", sec)
+        return [
+            "",
+            "  ● 말씀하세요 (손 떼면 종료)",
+            "",
+            "  신호 [\(bar)]  \(secText)초",
+            "  수신 \(micPackets) pkt · 방향 \(micDOA)°"
+        ].joined(separator: "\n")
+    }
+
+    private func renderAgent() -> String {
+        let status = toastMessage ?? "대기 중 · 길게 눌러 음성 입력"
+        return [
+            "  Antigravity Dots 음성 허브",
+            "",
+            "  상태: \(status)",
+            "  \(lastVoiceSummary)",
+            "",
+            "길게 누르기: 말하기 · 더블탭: 홈"
+        ].joined(separator: "\n")
     }
 
     private func renderReader() -> String {
         let doc = currentDocument
-        let visible = 5
+        let visible = 4
         let slice = Array(doc.lines.dropFirst(readerScrollOffset).prefix(visible))
-        let playTag = readerAutoScroll ? "▶자동" : "⏸수동"
-        let header = "◀ \(doc.title) (\(readerDocIndex + 1)/\(documents.count)) ▶ [\(playTag)]"
-        let footer = "줄 \(readerScrollOffset + 1)/\(max(1, doc.lines.count)) | ↑↓스크롤 | 클릭:자동 | ←→문서"
-        return ([header] + slice + [footer]).joined(separator: "\n")
+        let playTag = readerAutoScroll ? "자동" : "수동"
+        let top = "◀ \(doc.title) (\(readerDocIndex + 1)/\(documents.count)) ▶ [\(playTag)]"
+        let footer = "줄 \(readerScrollOffset + 1)/\(max(1, doc.lines.count)) · ↑↓스크롤 · 더블탭 홈"
+        return ([top] + slice + [footer]).joined(separator: "\n")
     }
 
-    private func renderMic() -> String {
-        let sec = Double(micDurationMs) / 1000.0
-        let levelNorm = max(0, min(10, Int(abs(Int(micSignal))) / 300))
-        let bar = String(repeating: "█", count: levelNorm) + String(repeating: "░", count: 10 - levelNorm)
+    private func renderBriefing() -> String {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy년 M월 d일 (E)"
+        df.locale = Locale(identifier: "ko_KR")
+        let bat = g2Battery.map { "\($0)%\(g2Charging ? " 충전중" : "")" } ?? "조회 중"
+        let flic = flicConnected ? String(format: "연결 (%.2fV)", flicVoltage) : "대기"
+        let lock = alwaysOnEnabled ? "항시 유지 ON" : "일반 모드"
         return [
-            "상태: \(isMicOn ? "● G2 마이크 수신 중 (LC3 16kHz)" : "○ 대기 중")",
-            String(format: "수신: %d pkt (%.1f초)", micPackets, sec),
-            "신호: [\(bar)] (\(micSignal)) | 방향: \(micDOA)°",
+            "  \(df.string(from: Date()))",
+            "  G2 배터리: \(bat) · 밝기 \(brightness)/50",
+            "  OS 보호: \(lock) · 무음 \(silentMode ? "ON" : "OFF")",
+            "  리모콘: \(flic)",
             "",
-            "클릭/홀드: 마이크 On/Off",
-            "오른쪽(→): .lc3 녹음 저장 | 뒤로: 홈"
+            "탭: 새로고침 · 더블탭: 홈"
         ].joined(separator: "\n")
-    }
-
-    private func renderDpadTest() -> String {
-        var gridLines: [String] = []
-        for y in 0..<5 {
-            var line = ""
-            for x in 0..<11 {
-                line += (x == padX && y == padY) ? "◆" : "·"
-            }
-            if y == 0 { line += "  좌표:(\(padX),\(padY))" }
-            if y == 1 { line += "  스크롤:\(padScrollValue)" }
-            if y == 2 { line += "  클릭:리셋" }
-            if y == 3 { line += "  뒤로:홈" }
-            gridLines.append(line)
-        }
-        gridLines.append("최근: \(lastActionSummary)")
-        return gridLines.joined(separator: "\n")
     }
 
     private func renderSettings() -> String {
         let items = [
-            "밝기 조절: < \(brightness) / 50 >",
-            "무음 모드: \(silentMode ? "[ON]" : "[OFF]")",
-            "배터리/펌웨어 새로고침",
-            "G2 화면 절전 모드로 전환"
+            "화면 밝기   < \(brightness) / 50 >",
+            "무음 모드   [\(silentMode ? "ON" : "OFF")]",
+            "배터리 · 펌웨어 새로고침"
         ]
         var lines = items.enumerated().map { idx, text in
-            idx == settingsIndex ? "▶ \(text)" : "  \(text)"
+            idx == settingsIndex ? "▶ \(text)" : "   \(text)"
         }
         lines.append("")
-        lines.append("↑↓이동 | ←→값변경 | 클릭:실행 | 뒤로:홈")
+        if let toast = toastMessage {
+            lines.append("  · \(toast)")
+        } else {
+            lines.append("↑↓이동 · ←→조절 · 탭 실행 · 더블탭 홈")
+        }
         return lines.joined(separator: "\n")
     }
 }

@@ -92,38 +92,44 @@ final class G2ProtocolTests: XCTestCase {
         XCTAssertEqual(pkt?.counter, 99)
     }
 
-    func testOSStateMachineAllControls() {
+    func testHomeGridNavigationAndAlwaysOnProtection() {
         let os = G2OSStateMachine()
-        var micState: Bool?
+        var micEvents: [Bool] = []
+        var sleepCalled = false
         var brightnessSet: Int?
-        os.onToggleMic = { micState = $0 }
+        os.onToggleMic = { micEvents.append($0) }
+        os.onSetScreenAsleep = { if $0 { sleepCalled = true } }
         os.onSetBrightness = { brightnessSet = $0 }
 
-        // 1. Navigate Home 2x3 grid with right/down and open 4-way D-pad test (row 1, col 1)
-        os.handle(RemoteCommandEvent(action: .right, source: .virtualPad))
-        os.handle(RemoteCommandEvent(action: .down, source: .virtualPad))
-        os.handle(RemoteCommandEvent(action: .select, source: .virtualPad))
-        XCTAssertEqual(os.currentScreen, .dpadTest)
+        // 1. Back (double-tap) on Home must NEVER sleep or exit to stock OS
+        os.handle(RemoteCommandEvent(action: .back, source: .motionPad))
+        XCTAssertEqual(os.currentScreen, .home)
+        XCTAssertFalse(os.isScreenAsleep)
+        XCTAssertFalse(sleepCalled)
 
-        // 2. Test 4-way movement & scrolling
-        os.handle(RemoteCommandEvent(action: .up, source: .flicDuo))
-        os.handle(RemoteCommandEvent(action: .left, source: .flicDuo))
-        os.handle(RemoteCommandEvent(action: .scrollUp, source: .flicDuo))
-        XCTAssertEqual(os.padX, 4)
-        XCTAssertEqual(os.padY, 1)
-        XCTAssertEqual(os.padScrollValue, 5)
+        // 2. Navigate 2x2 Home grid: Right -> (0,1) Memo Reader, Down -> (1,1) Settings, Tap -> open Settings
+        os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
+        os.handle(RemoteCommandEvent(action: .down, source: .motionPad))
+        os.handle(RemoteCommandEvent(action: .select, source: .motionPad))
+        XCTAssertEqual(os.currentScreen, .settings)
 
-        // 3. Global Mic toggle from any screen
-        os.handle(RemoteCommandEvent(action: .micToggle, source: .flicDuo))
-        XCTAssertEqual(micState, true)
-        XCTAssertTrue(os.isMicOn)
-
-        // 4. Global Brightness control
-        os.handle(RemoteCommandEvent(action: .brightnessUp, source: .flicDuo))
+        // 3. Adjust brightness inside Settings via swipe right
+        os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
         XCTAssertEqual(brightnessSet, 30)
 
-        // 5. Return home
-        os.handle(RemoteCommandEvent(action: .home, source: .flicDuo))
+        // 4. Double-tap returns to Home
+        os.handle(RemoteCommandEvent(action: .back, source: .motionPad))
         XCTAssertEqual(os.currentScreen, .home)
+
+        // 5. Push-to-Talk: Hold -> micStart (open), Release -> micStop (close), idempotent
+        os.handle(RemoteCommandEvent(action: .micStart, source: .motionPad))
+        os.handle(RemoteCommandEvent(action: .micStart, source: .motionPad))
+        XCTAssertTrue(os.isMicOn)
+        XCTAssertTrue(os.renderedFrameText.contains("MIC 듣는 중"))
+
+        os.handle(RemoteCommandEvent(action: .micStop, source: .motionPad))
+        os.handle(RemoteCommandEvent(action: .micStop, source: .motionPad))
+        XCTAssertFalse(os.isMicOn)
+        XCTAssertEqual(micEvents, [true, false])
     }
 }

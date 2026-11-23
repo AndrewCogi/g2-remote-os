@@ -18,13 +18,14 @@ public enum G2ConnectionPhase: String {
     case scanning = "안경 검색 중..."
     case connecting = "좌/우 렌즈 연결 중..."
     case handshaking = "인증 및 세션 초기화 중..."
-    case connected = "연결됨 (세션 활성)"
+    case connected = "연결됨"
 }
 
 /// Manages dual-lens CoreBluetooth links to Even Realities G2 glasses with:
-/// - Background `bluetooth-central` State Restoration
+/// - Background `bluetooth-central` State Restoration & unexpected-drop auto-reconnection
+/// - Always-On OS Guard: 3.5s heartbeat + iOS suspension gap detection + stock-OS exit interception
 /// - Serialized packet write queue (prevents multi-fragment reassembly corruption)
-/// - Live-confirmed Auth -> Prelude -> EvenHub CreatePage / TextUpgrade -> 4s Heartbeat -> 60s Keepalive
+/// - Live-confirmed Auth -> Prelude -> EvenHub CreatePage / TextUpgrade -> Heartbeat -> 60s Keepalive
 /// - Raw LC3 microphone stream subscription on 0x6402
 public final class G2BLEManager: NSObject, ObservableObject {
     @Published public private(set) var bluetoothState: CBManagerState = .unknown
@@ -32,6 +33,8 @@ public final class G2BLEManager: NSObject, ObservableObject {
     @Published public private(set) var discoveredPairs: [DiscoveredG2Pair] = []
     @Published public private(set) var leftConnected: Bool = false
     @Published public private(set) var rightConnected: Bool = false
+    @Published public private(set) var hasSavedPair: Bool = false
+    @Published public private(set) var alwaysStayInCustomOS: Bool = true
     @Published public private(set) var batteryLevel: Int?
     @Published public private(set) var isCharging: Bool = false
     @Published public private(set) var silentMode: Bool = false
@@ -72,8 +75,17 @@ public final class G2BLEManager: NSObject, ObservableObject {
 
     private var sessionReady = false
     private var pageCreated = false
-    private var lastRenderedText: String = "G2 Remote OS Ready"
+    private var screenAsleepLocked = false
+    private var alwaysStayLocked = true
+    private var micEnabledLocked = false
+    private var userInitiatedDisconnect = false
+    private var autoReconnectAttemptedOnBoot = false
+
+    private var lastRenderedText: String = "G2 OS 준비 중..."
     private var lastHeartbeatSentAt: Date = .distantPast
+    private var lastPageCreatedAt: Date = .distantPast
+    private var recentExitRecoveries: [Date] = []
+    private var exitRecoveryWorkItem: DispatchWorkItem?
     private var heartbeatTimer: DispatchSourceTimer?
     private var keepaliveTimer: DispatchSourceTimer?
     private var handshakeStarted = false
@@ -96,6 +108,8 @@ public final class G2BLEManager: NSObject, ObservableObject {
 
     public override init() {
         super.init()
+        let saved = (defaults.string(forKey: savedLeftKey) != nil && defaults.string(forKey: savedRightKey) != nil)
+        self.hasSavedPair = saved
         central = CBCentralManager(
             delegate: self,
             queue: bleQueue,
@@ -108,12 +122,34 @@ public final class G2BLEManager: NSObject, ObservableObject {
 
     // MARK: - Public Controls
 
+    public func setAlwaysStayInCustomOS(_ enabled: Bool) {
+        DispatchQueue.main.async { self.alwaysStayInCustomOS = enabled }
+        bleQueue.async { [weak self] in
+            guard let self else { return }
+            self.alwaysStayLocked = enabled
+            if enabled && self.sessionReady {
+                self.screenAsleepLocked = false
+                DispatchQueue.main.async { self.isScreenAsleep = false }
+                self.ensureScreenActiveLocked(forceRecreate: !self.pageCreated, reason: "항시 OS 유지 활성화")
+            }
+        }
+    }
+
     public func startScan() {
         bleQueue.async { [weak self] in
             guard let self else { return }
             guard self.central.state == .poweredOn else {
                 self.emitLog("[G2] 블루투스가 꺼져 있어 스캔할 수 없습니다.")
                 return
+            }
+            // Cancel any pending half-open auto-reconnect before scanning fresh.
+            if !self.sessionReady {
+                if let lp = self.leftPeripheral, lp.state == .connecting {
+                    self.central.cancelPeripheralConnection(lp)
+                }
+                if let rp = self.rightPeripheral, rp.state == .connecting {
+                    self.central.cancelPeripheralConnection(rp)
+                }
             }
             self.setPhase(.scanning)
             self.emitLog("[G2] G2 좌/우 렌즈 스캔 시작 (공식 Even 앱이 연결 중이면 먼저 종료하세요)")
@@ -153,13 +189,15 @@ public final class G2BLEManager: NSObject, ObservableObject {
                 return
             }
             self.central.stopScan()
+            self.userInitiatedDisconnect = false
             self.defaults.set(lId.uuidString, forKey: self.savedLeftKey)
             self.defaults.set(rId.uuidString, forKey: self.savedRightKey)
+            DispatchQueue.main.async { self.hasSavedPair = true }
             self.connectPeripherals(left: lp, right: rp)
         }
     }
 
-    public func reconnectSavedPair() {
+    public func reconnectSavedPair(fallbackToScan: Bool = true) {
         bleQueue.async { [weak self] in
             guard let self else { return }
             guard self.central.state == .poweredOn else { return }
@@ -168,17 +206,22 @@ public final class G2BLEManager: NSObject, ObservableObject {
                   let lId = UUID(uuidString: lStr),
                   let rId = UUID(uuidString: rStr)
             else {
-                self.emitLog("[G2] 저장된 안경 페어 정보가 없습니다. 먼저 스캔해 주세요.")
+                if fallbackToScan {
+                    self.emitLog("[G2] 저장된 안경 페어 정보가 없습니다. 먼저 스캔해 주세요.")
+                }
                 return
             }
             let retrieved = self.central.retrievePeripherals(withIdentifiers: [lId, rId])
             guard let lp = retrieved.first(where: { $0.identifier == lId }),
                   let rp = retrieved.first(where: { $0.identifier == rId })
             else {
-                self.emitLog("[G2] 저장된 렌즈 핸들을 찾지 못해 스캔을 시작합니다.")
-                self.startScan()
+                if fallbackToScan {
+                    self.emitLog("[G2] 저장된 렌즈 핸들을 찾지 못해 스캔을 시작합니다.")
+                    self.startScan()
+                }
                 return
             }
+            self.userInitiatedDisconnect = false
             self.peripheralsById[lId] = lp
             self.peripheralsById[rId] = rp
             self.emitLog("[G2] 저장된 좌/우 렌즈로 자동 재연결 시도...")
@@ -189,10 +232,15 @@ public final class G2BLEManager: NSObject, ObservableObject {
     public func disconnect() {
         bleQueue.async { [weak self] in
             guard let self else { return }
+            self.userInitiatedDisconnect = true
+            self.exitRecoveryWorkItem?.cancel()
+            self.exitRecoveryWorkItem = nil
             self.stopTimers()
             self.sessionReady = false
             self.pageCreated = false
             self.handshakeStarted = false
+            self.micEnabledLocked = false
+            self.screenAsleepLocked = false
             self.writeQueue.removeAll()
 
             if let lp = self.leftPeripheral { self.central.cancelPeripheralConnection(lp) }
@@ -212,8 +260,23 @@ public final class G2BLEManager: NSObject, ObservableObject {
         }
     }
 
+    /// Re-verifies our custom OS is actively rendered on the glasses (called on foreground or user tap).
+    public func ensureScreenActive(forceRecreate: Bool = false) {
+        bleQueue.async { [weak self] in
+            guard let self else { return }
+            if self.sessionReady {
+                self.ensureScreenActiveLocked(
+                    forceRecreate: forceRecreate,
+                    reason: forceRecreate ? "수동 화면 복구" : "포그라운드 복귀 화면 확인"
+                )
+            } else if !self.userInitiatedDisconnect && self.central.state == .poweredOn && self.phase == .disconnected {
+                self.reconnectSavedPair(fallbackToScan: false)
+            }
+        }
+    }
+
     /// Renders full-screen text on the G2 576x288 EvenHub canvas.
-    /// Automatically recovers the page if the glasses slept during background idle.
+    /// Automatically recovers the page if the glasses slept or dropped to stock OS.
     public func renderScreenText(_ text: String) {
         bleQueue.async { [weak self] in
             guard let self else { return }
@@ -221,16 +284,10 @@ public final class G2BLEManager: NSObject, ObservableObject {
             guard self.sessionReady else { return }
 
             let now = Date()
-            let heartbeatStale = now.timeIntervalSince(self.lastHeartbeatSentAt) > 9.0
+            let heartbeatStale = now.timeIntervalSince(self.lastHeartbeatSentAt) > 8.5
 
-            if self.isScreenAsleep || !self.pageCreated || heartbeatStale {
-                DispatchQueue.main.async { self.isScreenAsleep = false }
-                self.startHeartbeatTimer()
-                self.enqueue(side: .right, data: G2Commands.preludeFrame)
-                let createPb = G2Commands.buildCreateInputPage(magic: self.nextMagic(), text: text)
-                self.enqueueProtobuf(createPb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
-                self.pageCreated = true
-                self.emitLog("[G2] 화면 깨우기/페이지 생성 완료")
+            if self.screenAsleepLocked || !self.pageCreated || heartbeatStale {
+                self.recreatePageLocked(reason: "화면 깨우기/페이지 복구")
             } else {
                 let upgradePb = G2Commands.buildTextUpgrade(magic: self.nextMagic(), text: text)
                 self.enqueueProtobuf(upgradePb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
@@ -238,10 +295,14 @@ public final class G2BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// Toggles the G2 built-in microphone (SID 0xE0 cmd 15). Raw LC3 streams on 0x6402.
+    /// Opens or closes the G2 built-in microphone (SID 0xE0 cmd 15). Raw LC3 streams on 0x6402.
+    /// Idempotent so Push-to-Talk hold/release never sends redundant toggles.
     public func setMicrophoneEnabled(_ enabled: Bool) {
         bleQueue.async { [weak self] in
             guard let self else { return }
+            if enabled == self.micEnabledLocked { return }
+            self.micEnabledLocked = enabled
+
             if enabled {
                 self.micRecordingData.removeAll(keepingCapacity: true)
                 DispatchQueue.main.async {
@@ -251,15 +312,15 @@ public final class G2BLEManager: NSObject, ObservableObject {
             }
             DispatchQueue.main.async { self.isMicEnabled = enabled }
             guard self.sessionReady else {
-                self.emitLog("[G2] 마이크 \(enabled ? "ON" : "OFF") (오프라인 시뮬레이션)")
+                self.emitLog("[G2] 마이크 \(enabled ? "열기" : "끄기") (오프라인)")
                 return
             }
-            if !self.pageCreated {
-                self.renderScreenText(self.lastRenderedText)
+            if !self.pageCreated || self.screenAsleepLocked {
+                self.recreatePageLocked(reason: "마이크 시작 전 세션 복구")
             }
             let pb = G2Commands.buildAudioControl(magic: self.nextMagic(), enable: enabled)
             self.enqueueProtobuf(pb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
-            self.emitLog("[G2] 내장 마이크 \(enabled ? "켜기 (0x6402 LC3 수신 대기)" : "끄기") 명령 전송")
+            self.emitLog("[G2] 내장 마이크 \(enabled ? "열기 (0x6402 LC3 수신 중)" : "끄기")")
         }
     }
 
@@ -275,7 +336,7 @@ public final class G2BLEManager: NSObject, ObservableObject {
         guard let url = docs?.appendingPathComponent(filename) else { return nil }
         do {
             try snapshot.write(to: url)
-            emitLog("[G2] 마이크 녹음 저장 완료: \(filename) (\(snapshot.count) bytes)")
+            emitLog("[G2] 마이크 녹음 저장: \(filename) (\(snapshot.count) bytes)")
             return url
         } catch {
             emitLog("[G2] 녹음 저장 실패: \(error.localizedDescription)")
@@ -313,25 +374,32 @@ public final class G2BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// Puts the EvenHub canvas to sleep (stops 4s heartbeat) or wakes it back up immediately.
+    /// Puts the EvenHub canvas to sleep (only when Always-On OS lock is OFF) or wakes it immediately.
     public func setScreenAsleep(_ asleep: Bool) {
         bleQueue.async { [weak self] in
             guard let self else { return }
+            if asleep && self.alwaysStayLocked {
+                self.emitLog("[G2] 항시 OS 유지 모드이므로 절전(기본 OS 복귀)을 차단했습니다.")
+                return
+            }
+            self.screenAsleepLocked = asleep
             DispatchQueue.main.async { self.isScreenAsleep = asleep }
             if asleep {
                 self.heartbeatTimer?.cancel()
                 self.heartbeatTimer = nil
                 self.pageCreated = false
-                self.emitLog("[G2] 화면 절전 요청 (EvenHub 하트비트 정지 → ~5초 후 절전)")
+                self.emitLog("[G2] 화면 절전 요청 (하트비트 정지)")
             } else if self.sessionReady {
-                self.renderScreenText(self.lastRenderedText)
+                self.recreatePageLocked(reason: "화면 깨우기")
             }
         }
     }
 
-    // MARK: - Internal Connection & Handshake
+    // MARK: - Internal Connection, Handshake & Always-On Recovery
 
     private func connectPeripherals(left: CBPeripheral, right: CBPeripheral) {
+        exitRecoveryWorkItem?.cancel()
+        exitRecoveryWorkItem = nil
         stopTimers()
         sessionReady = false
         pageCreated = false
@@ -390,24 +458,87 @@ public final class G2BLEManager: NSObject, ObservableObject {
                         self.enqueueProtobuf(createPb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
 
                         self.pageCreated = true
+                        self.screenAsleepLocked = false
                         self.sessionReady = true
+                        self.lastPageCreatedAt = Date()
+                        self.lastHeartbeatSentAt = Date()
+                        DispatchQueue.main.async { self.isScreenAsleep = false }
                         self.setPhase(.connected)
                         self.startHeartbeatTimer()
                         self.startKeepaliveTimer()
-                        self.emitLog("[G2] 세션 연결 완료! (4초 하트비트 + 60초 Keepalive 동작 중)")
+                        self.emitLog("[G2] 세션 연결 완료! (3.5초 하트비트 + 항시 OS 유지 활성)")
                     }
                 }
             }
         }
     }
 
+    private func ensureScreenActiveLocked(forceRecreate: Bool, reason: String) {
+        guard sessionReady else { return }
+        let stale = Date().timeIntervalSince(lastHeartbeatSentAt) > 7.5
+        if forceRecreate || !pageCreated || screenAsleepLocked || stale {
+            recreatePageLocked(reason: reason)
+        } else if heartbeatTimer == nil {
+            startHeartbeatTimer()
+        }
+    }
+
+    private func recreatePageLocked(reason: String) {
+        guard sessionReady else { return }
+        screenAsleepLocked = false
+        DispatchQueue.main.async { self.isScreenAsleep = false }
+
+        enqueue(side: .right, data: G2Commands.preludeFrame)
+        let createPb = G2Commands.buildCreateInputPage(magic: nextMagic(), text: lastRenderedText)
+        enqueueProtobuf(createPb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+
+        pageCreated = true
+        lastPageCreatedAt = Date()
+        lastHeartbeatSentAt = Date()
+        if heartbeatTimer == nil {
+            startHeartbeatTimer()
+        }
+        emitLog("[G2] \(reason)")
+    }
+
+    private func scheduleExitRecoveryLocked(eventLabel: String) {
+        guard alwaysStayLocked, sessionReady, !screenAsleepLocked else { return }
+
+        let now = Date()
+        // Ignore transient exit echoes immediately after we ourselves recreated the page.
+        if now.timeIntervalSince(lastPageCreatedAt) < 1.2 {
+            return
+        }
+
+        recentExitRecoveries = recentExitRecoveries.filter { now.timeIntervalSince($0) < 10.0 }
+        let delay: TimeInterval = recentExitRecoveries.count >= 3 ? 2.0 : 0.35
+        recentExitRecoveries.append(now)
+
+        exitRecoveryWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.alwaysStayLocked, self.sessionReady, !self.screenAsleepLocked, !self.pageCreated else { return }
+            self.recreatePageLocked(reason: "기본 OS 이탈(\(eventLabel)) 차단 → 우리 OS 자동 복귀")
+        }
+        exitRecoveryWorkItem = work
+        bleQueue.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
     private func startHeartbeatTimer() {
         heartbeatTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: bleQueue)
-        timer.schedule(deadline: .now() + 4.0, repeating: 4.0)
+        timer.schedule(deadline: .now() + 3.5, repeating: 3.5, leeway: .milliseconds(200))
         timer.setEventHandler { [weak self] in
-            guard let self, self.sessionReady, !self.isScreenAsleep else { return }
-            self.lastHeartbeatSentAt = Date()
+            guard let self, self.sessionReady, !self.screenAsleepLocked else { return }
+            let now = Date()
+            let gap = now.timeIntervalSince(self.lastHeartbeatSentAt)
+
+            // Check gap BEFORE updating lastHeartbeatSentAt so iOS suspension wakes recreate the page cleanly!
+            if gap > 8.5 || !self.pageCreated {
+                self.recreatePageLocked(reason: String(format: "하트비트 공백(%.1f초) 감지 → OS 화면 자동 복구", gap))
+                return
+            }
+
+            self.lastHeartbeatSentAt = now
             let hb = G2Commands.buildHeartbeat(magic: self.nextMagic())
             self.enqueueProtobuf(hb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
         }
@@ -570,9 +701,24 @@ extension G2BLEManager: CBCentralManagerDelegate {
         DispatchQueue.main.async { self.bluetoothState = st }
         if st == .poweredOn {
             emitLog("[G2] CoreBluetooth 준비 완료")
-            // If peripherals were restored in connected state, re-discover their services.
-            for p in [rightPeripheral, leftPeripheral].compactMap({ $0 }) where p.state == .connected {
-                p.discoverServices([G2Constants.serviceControl, G2Constants.serviceAudio])
+            let restored = [rightPeripheral, leftPeripheral].compactMap { $0 }
+            if !restored.isEmpty {
+                for p in restored {
+                    if p.state == .connected {
+                        if let s = side(of: p) {
+                            DispatchQueue.main.async {
+                                if s == .left { self.leftConnected = true }
+                                else { self.rightConnected = true }
+                            }
+                        }
+                        p.discoverServices([G2Constants.serviceControl, G2Constants.serviceAudio])
+                    } else if !userInitiatedDisconnect {
+                        central.connect(p, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
+                    }
+                }
+            } else if !autoReconnectAttemptedOnBoot && !userInitiatedDisconnect {
+                autoReconnectAttemptedOnBoot = true
+                reconnectSavedPair(fallbackToScan: false)
             }
         }
     }
@@ -608,18 +754,34 @@ extension G2BLEManager: CBCentralManagerDelegate {
         DispatchQueue.main.async {
             if lensSide == .left { self.leftConnected = false }
             else { self.rightConnected = false }
+            self.isMicEnabled = false
         }
+        if lensSide == .left {
+            leftWriteChar = nil
+            leftNotifyReady = false
+        } else {
+            rightWriteChar = nil
+            rightNotifyReady = false
+        }
+        assemblers[lensSide]?.reset()
+
+        exitRecoveryWorkItem?.cancel()
+        exitRecoveryWorkItem = nil
         stopTimers()
         sessionReady = false
         pageCreated = false
         handshakeStarted = false
-        setPhase(.disconnected)
-        emitLog("[G2] \(lensSide.displayName) 연결 끊김 (\(error?.localizedDescription ?? "정상 종료"))")
+        micEnabledLocked = false
 
-        // Automatic background reconnection on unexpected drops.
-        if error != nil {
-            emitLog("[G2] 예기치 않은 끊김 → 자동 재연결 예약")
+        emitLog("[G2] \(lensSide.displayName) 연결 끊김 (\(error?.localizedDescription ?? "링크 해제"))")
+
+        // Automatically reconnect in the background unless the user explicitly tapped Disconnect.
+        if !userInitiatedDisconnect {
+            setPhase(.connecting)
+            emitLog("[G2] 백그라운드 자동 재연결 대기 중...")
             central.connect(peripheral, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
+        } else {
+            setPhase(.disconnected)
         }
     }
 }
@@ -645,6 +807,10 @@ extension G2BLEManager: CBPeripheralDelegate {
                 if lensSide == .left { leftWriteChar = char }
                 else { rightWriteChar = char }
             } else if char.uuid == G2Constants.charNotify {
+                if char.isNotifying {
+                    if lensSide == .left { leftNotifyReady = true }
+                    else { rightNotifyReady = true }
+                }
                 peripheral.setNotifyValue(true, for: char)
             } else if char.uuid == G2Constants.charAudioNotify {
                 peripheral.setNotifyValue(true, for: char)
@@ -695,7 +861,14 @@ extension G2BLEManager: CBPeripheralDelegate {
         switch frame.sid {
         case G2SID.evenHub:
             if let event = G2Commands.decodeDeviceEvent(frame.payload) {
-                emitLog("[G2 템플] \(event.source): \(event.eventType.label)")
+                switch event.eventType {
+                case .foregroundExit, .abnormalExit, .systemExit:
+                    self.pageCreated = false
+                    self.emitLog("[G2] 세션 이탈 이벤트: \(event.eventType.label)")
+                    self.scheduleExitRecoveryLocked(eventLabel: event.eventType.label)
+                default:
+                    emitLog("[G2 템플] \(event.source): \(event.eventType.label)")
+                }
                 DispatchQueue.main.async { self.onGlassesEvent?(event) }
             }
         case G2SID.settings:

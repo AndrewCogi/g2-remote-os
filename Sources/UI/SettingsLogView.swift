@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct SettingsLogView: View {
+    @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var coordinator: AppCoordinator
     @EnvironmentObject var ble: G2BLEManager
     @EnvironmentObject var os: G2OSStateMachine
@@ -8,36 +9,42 @@ struct SettingsLogView: View {
 
     @State private var customTitle: String = "내 메모"
     @State private var customBody: String = """
-    여기에 원하는 발표 대본이나 메모를 입력하세요.
-    저장하면 G2 안경의 '스크롤 리더' 3번째 문서로 즉시 올라갑니다.
-    Flic Duo로 화면 꺼진 상태에서 위/아래 스크롤할 수 있습니다.
+    여기에 발표 대본이나 메모를 입력하세요.
+    저장하면 G2 안경의 '메모 리더'에 즉시 반영됩니다.
+    모션 패드에서 위/아래 스와이프로 스크롤하세요.
     """
+    @State private var showLogs: Bool = false
 
     var body: some View {
         List {
             Section {
-                Toggle("화면 꺼짐 백그라운드 상시 유지 (무음 믹스)", isOn: $coordinator.keepAliveEnabled)
+                Toggle("항시 G2 OS 유지 (기존 OS 복귀 차단)", isOn: $coordinator.keepAliveEnabled)
+
                 HStack {
-                    Text("유지 엔진 상태")
+                    Text("백그라운드 보호")
                     Spacer()
-                    Text(keeper.isActive ? "동작 중 (4초 하트비트 보호)" : "꺼짐 (버튼 클릭 시 자동 복구)")
+                    Text(keeper.isActive ? "동작 중 (3.5초 하트비트 보호)" : "꺼짐")
                         .font(.caption)
                         .foregroundColor(keeper.isActive ? .green : .secondary)
                 }
+
+                Button("지금 G2 화면 강제 복구") {
+                    ble.ensureScreenActive(forceRecreate: true)
+                }
             } header: {
-                Text("백그라운드 동작 옵션")
+                Text("OS 항시 유지")
             } footer: {
-                Text("켜두면 아이폰 화면을 꺼도 4초 G2 하트비트가 멈추지 않아 화면이 즉시 유지됩니다(다른 앱 음악과 믹스됨). 꺼두어도 Flic Duo 버튼을 누르면 0.5초 내로 화면이 자동 복구됩니다.")
+                Text("켜두면 아이폰 화면을 꺼도 무음 오디오 믹스와 3.5초 하트비트로 G2가 기본 OS로 돌아가지 않도록 유지하며, 이탈 신호가 감지되어도 자동으로 복귀합니다.")
             }
 
-            Section("스크롤 리더용 내 문서 추가") {
+            Section("메모 리더 문서 편집") {
                 TextField("문서 제목", text: $customTitle)
                 TextEditor(text: $customBody)
                     .frame(height: 110)
                     .font(.caption)
-                Button("G2 스크롤 리더에 반영") {
+                Button("G2 메모 리더에 반영") {
                     os.updateCustomDocument(title: customTitle, body: customBody)
-                    coordinator.appendLog("[OS] 사용자 문서 반영 완료: \(customTitle)")
+                    coordinator.appendLog("[OS] 사용자 메모 반영: \(customTitle)")
                 }
                 .buttonStyle(.borderedProminent)
             }
@@ -51,24 +58,34 @@ struct SettingsLogView: View {
             }
 
             Section {
-                if coordinator.logs.isEmpty {
-                    Text("로그가 없습니다.").foregroundColor(.secondary)
-                } else {
-                    ForEach(Array(coordinator.logs.prefix(60).enumerated()), id: \.offset) { _, line in
-                        Text(line)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(.primary)
+                DisclosureGroup("실시간 시스템 로그 (\(coordinator.logs.count))", isExpanded: $showLogs) {
+                    if coordinator.logs.isEmpty {
+                        Text("로그가 없습니다.")
+                            .foregroundColor(.secondary)
+                    } else {
+                        Button("로그 지우기", role: .destructive) {
+                            coordinator.clearLogs()
+                        }
+                        .font(.caption)
+
+                        ForEach(Array(coordinator.logs.prefix(60).enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
                     }
                 }
             } header: {
-                HStack {
-                    Text("실시간 BLE / Flic / OS 로그")
-                    Spacer()
-                    Button("지우기") { coordinator.clearLogs() }
-                        .font(.caption)
-                }
+                Text("진단")
             }
         }
-        .navigationTitle("설정 & 로그")
+        .tint(.green)
+        .navigationTitle("설정")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("완료") { dismiss() }
+            }
+        }
     }
 }

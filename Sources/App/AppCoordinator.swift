@@ -2,9 +2,8 @@ import Combine
 import Foundation
 import UIKit
 
-/// Central singleton coordinating G2 BLE, Flic Duo background events, virtual pad, and the G2 mini OS.
-/// Kept as a singleton so `AppDelegate.didFinishLaunchingWithOptions` can restore both CoreBluetooth
-/// and `FLICManager` immediately during background wakes while the iPhone screen is locked.
+/// Central singleton coordinating G2 BLE, Always-On OS protection, Flic Duo,
+/// fullscreen Motion Pad inputs, and the G2 mini OS.
 public final class AppCoordinator: ObservableObject {
     public static let shared = AppCoordinator()
 
@@ -14,16 +13,22 @@ public final class AppCoordinator: ObservableObject {
     public let backgroundKeeper = BackgroundKeeper()
 
     @Published public private(set) var logs: [String] = []
-    @Published public var keepAliveEnabled: Bool = false {
+    @Published public var keepAliveEnabled: Bool = true {
         didSet {
-            UserDefaults.standard.set(keepAliveEnabled, forKey: "g2_bg_keepalive")
+            UserDefaults.standard.set(keepAliveEnabled, forKey: Self.keepAliveKey)
             backgroundKeeper.setEnabled(keepAliveEnabled)
+            ble.setAlwaysStayInCustomOS(keepAliveEnabled)
+            os.alwaysOnEnabled = keepAliveEnabled
+            os.refreshDisplay(pushToGlasses: false)
         }
     }
     @Published public var lastSavedRecordingPath: String?
 
+    private static let keepAliveKey = "g2_always_on_os_v2"
+
     private var bootstrapped = false
     private var cancellables = Set<AnyCancellable>()
+    private var observers: [NSObjectProtocol] = []
     private var lastMicRenderAt: Date = .distantPast
     private let logTimeFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -33,25 +38,43 @@ public final class AppCoordinator: ObservableObject {
 
     private init() {
         wireCallbacks()
+        installLifecycleObservers()
+    }
+
+    deinit {
+        for token in observers {
+            NotificationCenter.default.removeObserver(token)
+        }
     }
 
     /// Safe to call multiple times; executes initialization exactly once on launch.
     public func bootstrap() {
         guard !bootstrapped else { return }
         bootstrapped = true
-        appendLog("[SYS] G2 Remote OS 시작")
+        appendLog("[SYS] G2 OS 시작")
 
         flic.configure()
 
-        let savedKeepAlive = UserDefaults.standard.bool(forKey: "g2_bg_keepalive")
-        if savedKeepAlive {
-            keepAliveEnabled = true
+        // Always-On protection defaults to ON so the glasses never fall back to stock OS.
+        let saved: Bool
+        if UserDefaults.standard.object(forKey: Self.keepAliveKey) == nil {
+            saved = true
+        } else {
+            saved = UserDefaults.standard.bool(forKey: Self.keepAliveKey)
         }
+        keepAliveEnabled = saved
+        backgroundKeeper.setEnabled(saved)
+        ble.setAlwaysStayInCustomOS(saved)
+        os.alwaysOnEnabled = saved
+    }
+
+    public func triggerMotionAction(_ action: RemoteAction, detail: String = "") {
+        playHaptic(for: action)
+        os.handle(RemoteCommandEvent(action: action, source: .motionPad, detail: detail))
     }
 
     public func triggerVirtualAction(_ action: RemoteAction, detail: String = "") {
-        let generator = UIImpactFeedbackGenerator(style: .light)
-        generator.impactOccurred()
+        playHaptic(for: action)
         os.handle(RemoteCommandEvent(action: action, source: .virtualPad, detail: detail))
     }
 
@@ -59,27 +82,69 @@ public final class AppCoordinator: ObservableObject {
         DispatchQueue.main.async { self.logs.removeAll() }
     }
 
+    private func playHaptic(for action: RemoteAction) {
+        switch action {
+        case .micStart:
+            UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+        case .micStop:
+            UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+        case .select:
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        case .back:
+            UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+        default:
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
+    }
+
+    private func installLifecycleObservers() {
+        let nc = NotificationCenter.default
+        observers.append(
+            nc.addObserver(
+                forName: UIApplication.willEnterForegroundNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.backgroundKeeper.ensureRunning()
+                self.ble.ensureScreenActive(forceRecreate: false)
+            }
+        )
+        observers.append(
+            nc.addObserver(
+                forName: UIApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.backgroundKeeper.ensureRunning()
+            }
+        )
+    }
+
     private func wireCallbacks() {
         ble.onLog = { [weak self] msg in self?.appendLog(msg) }
         flic.onLog = { [weak self] msg in self?.appendLog(msg) }
+        backgroundKeeper.onLog = { [weak self] msg in self?.appendLog(msg) }
 
         // Forward Flic Duo hardware events -> OS
         flic.onAction = { [weak self] event in
             guard let self else { return }
-            self.appendLog("[Flic 입력] \(event.detail) → \(event.action.rawValue)")
+            self.appendLog("[Flic] \(event.detail) → \(event.action.rawValue)")
             self.os.handle(event)
         }
 
-        // Forward G2 temple touch events -> OS (so temple controls still work alongside the remote)
+        // Forward G2 temple touch events -> OS (ignore system exit notifications already handled by BLE guard)
         ble.onGlassesEvent = { [weak self] devEvent in
             guard let self else { return }
             let mapped: RemoteAction?
             switch devEvent.eventType {
             case .click: mapped = .select
             case .doubleClick: mapped = .back
-            case .scrollTop: mapped = .scrollUp
-            case .scrollBottom: mapped = .scrollDown
-            case .longPress: mapped = .micToggle
+            case .scrollTop: mapped = .up
+            case .scrollBottom: mapped = .down
+            case .longPress: mapped = .micStart
+            case .longPressRelease: mapped = .micStop
             default: mapped = nil
             }
             if let mapped {
@@ -87,7 +152,7 @@ public final class AppCoordinator: ObservableObject {
             }
         }
 
-        // Mic packet telemetry -> throttled G2 display refresh (every 500ms while on Mic screen)
+        // Mic packet telemetry -> throttled live G2 HUD refresh while Push-to-Talk mic is open
         ble.onMicPacket = { [weak self] packet in
             guard let self else { return }
             self.os.micPackets = self.ble.micPacketCount
@@ -96,7 +161,7 @@ public final class AppCoordinator: ObservableObject {
             if let d = packet.directionDegrees { self.os.micDOA = d }
 
             let now = Date()
-            if self.os.currentScreen == .mic && now.timeIntervalSince(self.lastMicRenderAt) >= 0.5 {
+            if self.os.isMicOn && now.timeIntervalSince(self.lastMicRenderAt) >= 0.45 {
                 self.lastMicRenderAt = now
                 self.os.refreshDisplay(pushToGlasses: true)
             }
@@ -134,9 +199,17 @@ public final class AppCoordinator: ObservableObject {
         ble.$batteryLevel
             .receive(on: DispatchQueue.main)
             .sink { [weak self] val in
-                self?.os.g2Battery = val
-                if self?.os.currentScreen == .dashboard { self?.os.refreshDisplay(pushToGlasses: true) }
+                guard let self else { return }
+                self.os.g2Battery = val
+                if self.os.currentScreen == .home || self.os.currentScreen == .briefing {
+                    self.os.refreshDisplay(pushToGlasses: true)
+                }
             }
+            .store(in: &cancellables)
+
+        ble.$isCharging
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] val in self?.os.g2Charging = val }
             .store(in: &cancellables)
 
         ble.$brightnessLevel
@@ -156,6 +229,11 @@ public final class AppCoordinator: ObservableObject {
                     self?.os.refreshDisplay(pushToGlasses: true)
                 }
             }
+            .store(in: &cancellables)
+
+        flic.$isReady
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] ready in self?.os.flicConnected = ready }
             .store(in: &cancellables)
 
         flic.$batteryVoltage

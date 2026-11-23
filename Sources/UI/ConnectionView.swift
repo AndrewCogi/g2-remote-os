@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ConnectionView: View {
+    @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var ble: G2BLEManager
     @EnvironmentObject var flic: FlicDuoDriver
 
@@ -21,7 +22,7 @@ struct ConnectionView: View {
                 }
                 if let battery = ble.batteryLevel {
                     HStack {
-                        Text("G2 배터리 / 펌웨어")
+                        Text("배터리 / 펌웨어")
                         Spacer()
                         Text("\(battery)% (\(ble.firmwareLeft)/\(ble.firmwareRight))")
                             .font(.caption.monospaced())
@@ -33,17 +34,23 @@ struct ConnectionView: View {
                         Button("스캔 중지", role: .destructive) { ble.stopScan() }
                     } else if ble.phase == .connected || ble.phase == .connecting || ble.phase == .handshaking {
                         Button("연결 해제", role: .destructive) { ble.disconnect() }
+                        if ble.phase == .connected {
+                            Button("화면 복구") { ble.ensureScreenActive(forceRecreate: true) }
+                                .buttonStyle(.bordered)
+                        }
                     } else {
                         Button("G2 안경 스캔") { ble.startScan() }
                             .buttonStyle(.borderedProminent)
-                        Button("저장된 페어 재연결") { ble.reconnectSavedPair() }
-                            .buttonStyle(.bordered)
+                        if ble.hasSavedPair {
+                            Button("빠른 재연결") { ble.reconnectSavedPair() }
+                                .buttonStyle(.bordered)
+                        }
                     }
                 }
             } header: {
-                Text("1. Even Realities G2 안경")
+                Text("Even Realities G2 안경")
             } footer: {
-                Text("중요: G2 안경은 한 번에 하나의 앱만 연결할 수 있습니다. 스캔 전에 공식 Even 앱을 완전히 종료(위로 밀어 닫기)해 주세요.")
+                Text("스캔 전에 공식 Even 앱을 완전히 종료해 주세요. 한 번 연결하면 다음부터는 자동으로 재연결됩니다.")
             }
 
             if !ble.discoveredPairs.isEmpty {
@@ -70,7 +77,7 @@ struct ConnectionView: View {
 
             Section {
                 HStack {
-                    Text("SDK 상태")
+                    Text("상태")
                     Spacer()
                     Text(flic.managerStateText)
                         .foregroundColor(.secondary)
@@ -88,20 +95,13 @@ struct ConnectionView: View {
                         Text(flic.batteryVoltage > 0 ? String(format: "%.2f V", flic.batteryVoltage) : "측정 중")
                             .font(.caption.monospaced())
                     }
-                    HStack {
-                        Text("최근 Flic 신호")
-                        Spacer()
-                        Text(flic.lastRawEventText)
-                            .font(.caption2.monospaced())
-                            .foregroundColor(.green)
-                    }
                 }
 
                 HStack(spacing: 10) {
                     if flic.isScanning {
                         Button("스캔 중지", role: .destructive) { flic.stopScan() }
                     } else {
-                        Button("Flic Duo 페어링 스캔") { flic.startScan() }
+                        Button("Flic Duo 페어링") { flic.startScan() }
                             .buttonStyle(.borderedProminent)
                     }
                     if flic.isReady && flic.isDuoHardware {
@@ -113,11 +113,18 @@ struct ConnectionView: View {
                     }
                 }
             } header: {
-                Text("2. Flic Duo / Flic 2 리모콘 (화면 꺼짐 백그라운드 지원)")
+                Text("Flic Duo 리모콘 (도착 후 연결)")
             } footer: {
-                Text("페어링 시 Flic Duo의 버튼을 6초 이상 길게 눌러 페어링 모드로 진입한 뒤 위 스캔 버튼을 누르세요. Flic Hub 없이 아이폰에 직접 연결됩니다.")
+                Text("Flic Duo 버튼을 6초 이상 길게 눌러 페어링 모드에 진입한 뒤 스캔을 누르세요.")
             }
         }
+        .tint(.green)
         .navigationTitle("기기 연결")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("완료") { dismiss() }
+            }
+        }
     }
 }
