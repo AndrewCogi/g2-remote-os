@@ -58,8 +58,10 @@ async def health():
         "ok": True,
         "host": socket.gethostname(),
         "stt_ready": stt.ready,
+        "stt_backend": stt.backend,
         "stt_model": stt.model_name,
         "stt_device": stt.device,
+        "stt_compute": stt.compute_type,
         "agy_bin": resolve_agy_binary(),
     }
 
