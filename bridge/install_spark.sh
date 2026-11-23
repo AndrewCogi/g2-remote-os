@@ -1,29 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-command installer for DGX Spark (spark01: 100.101.25.64 / spark02: 100.101.25.65).
-# Installs Python venv, faster-whisper (CUDA), lc3py, FastAPI bridge, and a 24/7 systemd user service.
+# One-command installer for DGX Spark ARM64 (spark01: 100.101.25.64 / spark02: 100.101.25.65).
+# Installs native liblc3-1 (apt), Python venv, faster-whisper (CUDA), FastAPI bridge, and systemd service.
 
 BRIDGE_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="${BRIDGE_DIR}/.venv"
 PORT="${G2_BRIDGE_PORT:-8765}"
 
-echo "=== 1. Creating Python venv at ${VENV_DIR} ==="
+echo "=== 1. Ensuring native Google liblc3 shared library (ARM64 compatible) ==="
+if ! ldconfig -p 2>/dev/null | grep -q "liblc3\.so"; then
+  echo "Installing liblc3-1 via apt..."
+  sudo apt-get update -qq || true
+  sudo apt-get install -y liblc3-1 || sudo apt-get install -y liblc3-dev || true
+fi
+
+echo "=== 2. Creating Python venv at ${VENV_DIR} ==="
 python3 -m venv "${VENV_DIR}"
 "${VENV_DIR}/bin/pip" install --upgrade pip wheel
 "${VENV_DIR}/bin/pip" install -r "${BRIDGE_DIR}/requirements.txt"
 
-echo "=== 2. Checking agy CLI & CUDA GPU ==="
+echo "=== 3. Checking agy CLI, CUDA GPU & liblc3 ==="
 AGY_BIN="$(command -v agy || echo "${HOME}/.local/bin/agy")"
 echo "agy path: ${AGY_BIN}"
-"${VENV_DIR}/bin/python" - <<'PY'
+PYTHONPATH="${BRIDGE_DIR}" "${VENV_DIR}/bin/python" - <<'PY'
 import ctranslate2
 print("CUDA devices visible to faster-whisper:", ctranslate2.get_cuda_device_count())
-import lc3
-print("lc3py import OK:", lc3)
+from audio_decoder import G2AudioDecoder, load_liblc3
+lib = load_liblc3()
+print("Native liblc3 loaded:", lib)
+if lib is not None:
+    dec = G2AudioDecoder("lc3_16k")
+    pcm = dec.decode(bytes(40))
+    print("Test LC3 decode samples:", len(pcm), pcm.dtype)
 PY
 
-echo "=== 3. Installing systemd --user service (g2-spark-bridge.service) ==="
+echo "=== 4. Installing systemd --user service (g2-spark-bridge.service) ==="
 mkdir -p "${HOME}/.config/systemd/user"
 cat > "${HOME}/.config/systemd/user/g2-spark-bridge.service" <<EOF
 [Unit]
@@ -49,7 +61,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now g2-spark-bridge.service
 loginctl enable-linger "${USER}" 2>/dev/null || true
 
-echo "=== 4. Done! Checking status ==="
+echo "=== 5. Done! Checking status ==="
 sleep 2
 systemctl --user status g2-spark-bridge.service --no-pager || true
 echo ""
