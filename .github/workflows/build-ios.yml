@@ -92,6 +92,8 @@ jobs:
           ls -la "$APP_PATH/Frameworks" || true
           mkdir -p build/Payload
           cp -R "$APP_PATH" build/Payload/
+          # Ensure embedded frameworks (e.g. flic2lib.framework) are owner-writable for macOS iloader/isideload signing.
+          chmod -R u+w build/Payload
           cd build
           zip -qry "$IPA_NAME" Payload
           cp "$IPA_NAME" G2RemoteOS.ipa
