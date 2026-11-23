@@ -15,6 +15,12 @@ struct SettingsLogView: View {
     """
     @State private var showLogs: Bool = false
 
+    private var appVersionText: String {
+        let short = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.2.0"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        return "v\(short) (Build \(build))"
+    }
+
     var body: some View {
         List {
             Section {
@@ -58,6 +64,14 @@ struct SettingsLogView: View {
             }
 
             Section {
+                HStack {
+                    Text("앱 버전")
+                    Spacer()
+                    Text(appVersionText)
+                        .font(.caption.monospaced())
+                        .foregroundColor(.secondary)
+                }
+
                 DisclosureGroup("실시간 시스템 로그 (\(coordinator.logs.count))", isExpanded: $showLogs) {
                     if coordinator.logs.isEmpty {
                         Text("로그가 없습니다.")

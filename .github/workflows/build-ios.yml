@@ -16,6 +16,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Compute version & build metadata
+        id: meta
+        run: |
+          BASE_VER=$(grep 'MARKETING_VERSION:' project.yml | sed -E 's/.*"([0-9]+\.[0-9]+).*/\1/')
+          APP_VER="${BASE_VER}.${GITHUB_RUN_NUMBER}"
+          TAG="v${APP_VER}"
+          IPA_NAME="G2RemoteOS-${TAG}.ipa"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "app_ver=${APP_VER}" >> "$GITHUB_OUTPUT"
+          echo "build_num=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "ipa_name=${IPA_NAME}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Building ${TAG} (${IPA_NAME}, commit ${SHORT_SHA})"
+
       - name: Verify protocol golden vectors & config
         run: python3 scripts/verify_protocol.py
 
@@ -55,16 +70,22 @@ jobs:
             -sdk iphoneos \
             -destination "generic/platform=iOS" \
             -derivedDataPath build/DerivedData \
+            MARKETING_VERSION="${{ steps.meta.outputs.app_ver }}" \
+            CURRENT_PROJECT_VERSION="${{ steps.meta.outputs.build_num }}" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             AD_HOC_CODE_SIGNING_ALLOWED=YES
 
-      - name: Package Unsigned IPA for SideStore
+      - name: Package Versioned Unsigned IPA for SideStore
+        id: pkg
         run: |
           APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/G2RemoteOS.app"
+          IPA_NAME="${{ steps.meta.outputs.ipa_name }}"
           test -d "$APP_PATH"
-          echo "=== Verifying Info.plist background modes ==="
+          echo "=== Verifying Info.plist version & background modes ==="
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_PATH/Info.plist"
           /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$APP_PATH/Info.plist"
           echo "=== Verifying compiled app icon & embedded frameworks ==="
           ls -la "$APP_PATH/Assets.car" || true
@@ -72,35 +93,104 @@ jobs:
           mkdir -p build/Payload
           cp -R "$APP_PATH" build/Payload/
           cd build
-          zip -qry G2RemoteOS.ipa Payload
-          ls -lh G2RemoteOS.ipa
+          zip -qry "$IPA_NAME" Payload
+          cp "$IPA_NAME" G2RemoteOS.ipa
+          IPA_SIZE=$(stat -f%z "$IPA_NAME")
+          echo "ipa_size=${IPA_SIZE}" >> "$GITHUB_OUTPUT"
+          ls -lh "$IPA_NAME"
 
-      - name: Upload G2RemoteOS.ipa Artifact
+      - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
           name: G2RemoteOS-ipa
-          path: build/G2RemoteOS.ipa
+          path: |
+            build/${{ steps.meta.outputs.ipa_name }}
+            build/G2RemoteOS.ipa
           retention-days: 30
 
-      - name: Publish Latest Release (Direct IPA for iPhone GitHub App)
+      - name: Publish Versioned GitHub Release & SideStore Source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="latest"
-          SHORT_SHA="${GITHUB_SHA::7}"
-          NOW_UTC="$(date -u '+%Y-%m-%d %H:%M UTC')"
-          TITLE="G2 OS Latest (${SHORT_SHA})"
-          NOTES="자동 빌드 (${NOW_UTC}, \`${SHORT_SHA}\`). 아래 **G2RemoteOS.ipa** 를 눌러 파일 앱 저장 후 SideStore에서 바로 설치하세요."
+          TAG="${{ steps.meta.outputs.tag }}"
+          APP_VER="${{ steps.meta.outputs.app_ver }}"
+          BUILD_NUM="${{ steps.meta.outputs.build_num }}"
+          IPA_NAME="${{ steps.meta.outputs.ipa_name }}"
+          IPA_SIZE="${{ steps.pkg.outputs.ipa_size }}"
+          SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
+          NOW_ISO="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${IPA_NAME}"
+          COMMIT_MSG="$(git log -1 --pretty=%s)"
 
-          git tag -f "$TAG" "$GITHUB_SHA"
-          git push -f origin "refs/tags/${TAG}"
+          NOTES=$(cat <<EOF
+          **G2 OS ${TAG}** (Build ${BUILD_NUM} · \`${SHORT_SHA}\`)
+          - 변경사항: ${COMMIT_MSG}
+          - [Safari로 ${IPA_NAME} 직접 다운로드](${DOWNLOAD_URL})
+          EOF
+          )
 
+          # 1. Create or update the versioned release (marked Latest, contains only the versioned .ipa)
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
-            gh release upload "$TAG" build/G2RemoteOS.ipa --clobber
+            gh release edit "$TAG" --title "G2 OS ${TAG}" --notes "$NOTES" --latest
+            gh release upload "$TAG" "build/${IPA_NAME}" --clobber
           else
-            gh release create "$TAG" build/G2RemoteOS.ipa \
-              --title "$TITLE" \
+            gh release create "$TAG" "build/${IPA_NAME}" \
+              --title "G2 OS ${TAG}" \
               --notes "$NOTES" \
+              --target "$GITHUB_SHA" \
               --latest
+          fi
+
+          # 2. Update permanent SideStore AltSource JSON under a dedicated non-latest tag (`sidestore`)
+          APP_VER="$APP_VER" \
+          BUILD_NUM="$BUILD_NUM" \
+          NOW_ISO="$NOW_ISO" \
+          COMMIT_MSG="$COMMIT_MSG" \
+          DOWNLOAD_URL="$DOWNLOAD_URL" \
+          IPA_SIZE="$IPA_SIZE" \
+          python3 - <<'PY'
+          import json, os
+          repo = os.environ["GITHUB_REPOSITORY"]
+          source = {
+              "name": "G2 OS",
+              "identifier": "com.g2remote.os.source",
+              "subtitle": "G2 Remote OS Personal Builds",
+              "apps": [
+                  {
+                      "name": "G2 Remote OS",
+                      "bundleIdentifier": "com.g2remote.os",
+                      "developerName": "AndrewCogi",
+                      "localizedDescription": "Even Realities G2 Custom OS with Fullscreen Motion Pad & Flic Duo",
+                      "iconURL": f"https://raw.githubusercontent.com/{repo}/main/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+                      "tintColor": "22C55E",
+                      "versions": [
+                          {
+                              "version": os.environ["APP_VER"],
+                              "buildVersion": os.environ["BUILD_NUM"],
+                              "date": os.environ["NOW_ISO"],
+                              "localizedDescription": os.environ["COMMIT_MSG"],
+                              "downloadURL": os.environ["DOWNLOAD_URL"],
+                              "size": int(os.environ["IPA_SIZE"]),
+                              "minOSVersion": "16.0"
+                          }
+                      ]
+                  }
+              ]
+          }
+          with open("build/source.json", "w", encoding="utf-8") as f:
+              json.dump(source, f, ensure_ascii=False, indent=2)
+          PY
+
+          git tag -f sidestore "$GITHUB_SHA"
+          git push -f origin refs/tags/sidestore
+
+          if gh release view sidestore >/dev/null 2>&1; then
+            gh release edit sidestore --title "SideStore Auto-Update Source" --notes "SideStore > Sources > + 에 \`https://github.com/${GITHUB_REPOSITORY}/releases/download/sidestore/source.json\` 추가" --latest=false --prerelease
+            gh release upload sidestore build/source.json --clobber
+          else
+            gh release create sidestore build/source.json \
+              --title "SideStore Auto-Update Source" \
+              --notes "SideStore > Sources > + 에 \`https://github.com/${GITHUB_REPOSITORY}/releases/download/sidestore/source.json\` 추가" \
+              --prerelease \
+              --latest=false
           fi

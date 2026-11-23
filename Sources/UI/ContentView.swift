@@ -338,6 +338,10 @@ struct ContentView: View {
                 Text("Flic 연결됨")
                     .font(.caption2.weight(.medium))
                     .foregroundColor(.green.opacity(0.85))
+            } else {
+                Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.2")")
+                    .font(.caption2.monospaced())
+                    .foregroundColor(.white.opacity(0.32))
             }
         }
         .padding(.horizontal, 4)
