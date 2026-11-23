@@ -3,8 +3,7 @@ import Foundation
 import UIKit
 
 /// Central singleton coordinating G2 BLE, Always-On OS protection, Flic Duo,
-/// fullscreen Motion Pad inputs, live data services (Weather, Calendar/QuickList, Pedometer, Alarm/Timer),
-/// and the G2 OS state machine.
+/// fullscreen Motion Pad, live free iOS data services, and the DGX Spark 2x real-time `agy` bridge.
 public final class AppCoordinator: ObservableObject {
     public static let shared = AppCoordinator()
 
@@ -12,6 +11,8 @@ public final class AppCoordinator: ObservableObject {
     public let flic = FlicDuoDriver()
     public let os = G2OSStateMachine()
     public let backgroundKeeper = BackgroundKeeper()
+    public let spark = SparkBridgeClient()
+    public let tailscale = TailscaleMonitor()
 
     // Live $0 free iOS data services
     public let weather = WeatherService()
@@ -37,6 +38,7 @@ public final class AppCoordinator: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var observers: [NSObjectProtocol] = []
     private var lastMicRenderAt: Date = .distantPast
+    private var lastAiDeltaRenderAt: Date = .distantPast
     private let logTimeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
@@ -57,7 +59,7 @@ public final class AppCoordinator: ObservableObject {
     public func bootstrap() {
         guard !bootstrapped else { return }
         bootstrapped = true
-        appendLog("[SYS] G2 OS v0.3 시작")
+        appendLog("[SYS] G2 OS v0.4 (DGX Spark agy) 시작")
 
         flic.configure()
 
@@ -72,12 +74,30 @@ public final class AppCoordinator: ObservableObject {
         ble.setAlwaysStayInCustomOS(saved)
         os.alwaysOnEnabled = saved
 
-        // Start free live services
         weather.start()
         calendar.start()
         pedometer.start()
         clockTools.start()
+        tailscale.start()
+        syncTailscaleToOS(connected: tailscale.isTailscaleConnected, ip: tailscale.tailscaleIPv4, push: false)
         syncAllServicesToOS(push: false)
+
+        if tailscale.isTailscaleConnected {
+            spark.connectWithFailover()
+        }
+    }
+
+    private func syncTailscaleToOS(connected: Bool, ip: String?, push: Bool) {
+        os.tailscaleConnected = connected
+        os.tailscaleIP = ip
+        if !connected {
+            os.sparkConnected = false
+            os.sparkActiveShortTag = ""
+            os.sparkNodeStatus = "TS 꺼짐"
+        } else if !spark.isConnected {
+            os.sparkNodeStatus = "Spark 연결 중"
+        }
+        os.refreshDisplay(pushToGlasses: push)
     }
 
     public func triggerMotionAction(_ action: RemoteAction, detail: String = "") {
@@ -125,41 +145,62 @@ public final class AppCoordinator: ObservableObject {
         os.refreshDisplay(pushToGlasses: push)
     }
 
+    private func executeVoiceOSCommands(_ commands: [SparkOSCommand]) {
+        for cmd in commands {
+            switch cmd {
+            case .timer(let seconds):
+                clockTools.setTimerDuration(seconds: seconds)
+                clockTools.toggleTimer()
+                os.notifyVoiceCommandExecuted("타이머 \(AlarmTimerService.formatDuration(seconds)) 시작")
+                appendLog("[음성 명령] 타이머 \(seconds)초 시작")
+            case .alarm(let hour, let minute, let label):
+                clockTools.addAlarm(hour: hour, minute: minute, label: label)
+                os.notifyVoiceCommandExecuted(String(format: "알람 %02d:%02d 설정", hour, minute))
+                appendLog(String(format: "[음성 명령] 알람 %02d:%02d (%@)", hour, minute, label))
+            case .task(let title):
+                calendar.addTask(title: title)
+                os.notifyVoiceCommandExecuted("할 일 추가: \(title)")
+                appendLog("[음성 명령] 할 일 추가: \(title)")
+            case .brightness(let level):
+                os.brightness = level
+                ble.setBrightness(level)
+                os.notifyVoiceCommandExecuted("밝기 \(level)/50")
+                appendLog("[음성 명령] 밝기 \(level)")
+            case .silent(let enabled):
+                os.silentMode = enabled
+                ble.setSilentMode(enabled)
+                os.notifyVoiceCommandExecuted("무음 모드 \(enabled ? "ON" : "OFF")")
+                appendLog("[음성 명령] 무음 \(enabled ? "ON" : "OFF")")
+            }
+        }
+    }
+
     private func playHaptic(for action: RemoteAction) {
         switch action {
-        case .micStart:
-            UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
-        case .micStop:
-            UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-        case .select:
-            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        case .back:
-            UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
-        default:
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        case .micStart: UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+        case .micStop: UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+        case .select: UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        case .back: UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+        default: UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
     }
 
     private func installLifecycleObservers() {
         let nc = NotificationCenter.default
         observers.append(
-            nc.addObserver(
-                forName: UIApplication.willEnterForegroundNotification,
-                object: nil,
-                queue: .main
-            ) { [weak self] _ in
+            nc.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
                 guard let self else { return }
                 self.backgroundKeeper.ensureRunning()
                 self.ble.ensureScreenActive(forceRecreate: false)
                 self.calendar.refresh()
+                self.tailscale.refresh()
+                if self.tailscale.isTailscaleConnected && !self.spark.isConnected {
+                    self.spark.connectWithFailover()
+                }
             }
         )
         observers.append(
-            nc.addObserver(
-                forName: UIApplication.didBecomeActiveNotification,
-                object: nil,
-                queue: .main
-            ) { [weak self] _ in
+            nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
                 self?.backgroundKeeper.ensureRunning()
             }
         )
@@ -169,8 +210,39 @@ public final class AppCoordinator: ObservableObject {
         ble.onLog = { [weak self] msg in self?.appendLog(msg) }
         flic.onLog = { [weak self] msg in self?.appendLog(msg) }
         backgroundKeeper.onLog = { [weak self] msg in self?.appendLog(msg) }
+        spark.onLog = { [weak self] msg in self?.appendLog(msg) }
 
-        // Forward Flic Duo hardware events -> OS
+        tailscale.onStatusChanged = { [weak self] connected, ip in
+            guard let self else { return }
+            self.appendLog("[Tailscale] \(connected ? "연결됨 (\(ip ?? ""))" : "연결 해제됨")")
+            self.syncTailscaleToOS(connected: connected, ip: ip, push: true)
+            if connected {
+                self.spark.connectWithFailover()
+            } else {
+                self.spark.disconnect()
+            }
+        }
+
+        // Forward DGX Spark real-time STT & `agy` streaming events -> G2 OS (with BLE delta throttling)
+        spark.onEvent = { [weak self] evt in
+            guard let self else { return }
+            switch evt {
+            case .aiDelta:
+                let now = Date()
+                if now.timeIntervalSince(self.lastAiDeltaRenderAt) >= 0.30 {
+                    self.lastAiDeltaRenderAt = now
+                    self.os.handleSparkEvent(evt)
+                }
+            case .aiDone(_, _, let commands, _):
+                self.os.handleSparkEvent(evt)
+                if !commands.isEmpty {
+                    self.executeVoiceOSCommands(commands)
+                }
+            default:
+                self.os.handleSparkEvent(evt)
+            }
+        }
+
         flic.onAction = { [weak self] event in
             guard let self else { return }
             self.appendLog("[Flic] \(event.detail) → \(event.action.rawValue)")
@@ -178,12 +250,10 @@ public final class AppCoordinator: ObservableObject {
             self.updateImuStreamingNeed()
         }
 
-        // Forward G2 IMU stream -> Head-Up Wake detector
         ble.onImuSample = { [weak self] sample in
             self?.os.handleImuSample(sample)
         }
 
-        // Forward G2 temple touch events -> OS
         ble.onGlassesEvent = { [weak self] devEvent in
             guard let self else { return }
             let mapped: RemoteAction?
@@ -202,22 +272,23 @@ public final class AppCoordinator: ObservableObject {
             }
         }
 
-        // Mic packet telemetry -> throttled live G2 HUD refresh
+        // Stream raw 0x6402 LC3 audio frames LIVE to DGX Spark WebSocket + throttle G2 Mic HUD
         ble.onMicPacket = { [weak self] packet in
             guard let self else { return }
+            self.spark.sendAudioChunk(packet.rawAudioBytes)
+
             self.os.micPackets = self.ble.micPacketCount
             self.os.micDurationMs = self.ble.micDurationMs
             if let s = packet.signalRatio { self.os.micSignal = s }
             if let d = packet.directionDegrees { self.os.micDOA = d }
 
             let now = Date()
-            if self.os.isMicOn && now.timeIntervalSince(self.lastMicRenderAt) >= 0.45 {
+            if self.os.isMicOn && !self.os.isTranslateActive && !self.os.isConversateActive && now.timeIntervalSince(self.lastMicRenderAt) >= 0.45 {
                 self.lastMicRenderAt = now
                 self.os.refreshDisplay(pushToGlasses: true)
             }
         }
 
-        // Service updates -> OS live refresh
         weather.onUpdate = { [weak self] _ in
             guard let self else { return }
             self.syncAllServicesToOS(push: self.os.currentScreen == .dashboard)
@@ -246,14 +317,24 @@ public final class AppCoordinator: ObservableObject {
             self?.syncAllServicesToOS(push: true)
         }
 
-        // Outbound OS actions -> Hardware & Services
-        os.onPageChanged = { [weak self] page in
-            self?.ble.renderPage(page)
-        }
+        // Outbound OS callbacks
+        os.onPageChanged = { [weak self] page in self?.ble.renderPage(page) }
         os.onToggleMic = { [weak self] enabled in
             guard let self else { return }
             self.ble.setMicrophoneEnabled(enabled)
             self.flic.playBuzzerFeedback(micEnabled: enabled)
+        }
+        os.onStartVoiceSession = { [weak self] mode, src, dst in
+            self?.spark.startAudioStream(mode: mode, srcLang: src, dstLang: dst)
+        }
+        os.onStopVoiceSession = { [weak self] _ in
+            self?.spark.stopAudioStream()
+        }
+        os.onRequestConversateSummary = { [weak self] in
+            self?.spark.sendTextPrompt(mode: .conversate, text: "__SUMMARIZE__")
+        }
+        os.onResetVoiceSession = { [weak self] mode in
+            self?.spark.resetSession(mode: mode)
         }
         os.onSaveMicRecording = { [weak self] in
             guard let self else { return }
@@ -283,7 +364,6 @@ public final class AppCoordinator: ObservableObject {
         os.onDismissAlert = { [weak self] in self?.clockTools.dismissActiveAlert() }
         os.onSnoozeAlert = { [weak self] in self?.clockTools.snoozeActiveAlert(minutes: 5) }
 
-        // Sync BLE hardware readback -> OS state
         ble.$batteryLevel
             .receive(on: DispatchQueue.main)
             .sink { [weak self] val in
@@ -292,52 +372,15 @@ public final class AppCoordinator: ObservableObject {
                 if self.os.currentScreen == .dashboard { self.os.refreshDisplay(pushToGlasses: true) }
             }
             .store(in: &cancellables)
-
-        ble.$isCharging
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] val in self?.os.g2Charging = val }
-            .store(in: &cancellables)
-
-        ble.$brightnessLevel
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] val in self?.os.brightness = val }
-            .store(in: &cancellables)
-
-        ble.$brightnessAuto
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] val in self?.os.autoBrightness = val }
-            .store(in: &cancellables)
-
-        ble.$displayHeight
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] val in self?.os.displayHeight = val }
-            .store(in: &cancellables)
-
-        ble.$displayDistance
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] val in self?.os.displayDistance = val }
-            .store(in: &cancellables)
-
-        ble.$wearDetection
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] val in self?.os.wearDetection = val }
-            .store(in: &cancellables)
-
-        ble.$silentMode
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] val in self?.os.silentMode = val }
-            .store(in: &cancellables)
-
-        ble.$firmwareLeft
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] val in self?.os.g2FirmwareLeft = val }
-            .store(in: &cancellables)
-
-        ble.$firmwareRight
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] val in self?.os.g2FirmwareRight = val }
-            .store(in: &cancellables)
-
+        ble.$isCharging.receive(on: DispatchQueue.main).sink { [weak self] v in self?.os.g2Charging = v }.store(in: &cancellables)
+        ble.$brightnessLevel.receive(on: DispatchQueue.main).sink { [weak self] v in self?.os.brightness = v }.store(in: &cancellables)
+        ble.$brightnessAuto.receive(on: DispatchQueue.main).sink { [weak self] v in self?.os.autoBrightness = v }.store(in: &cancellables)
+        ble.$displayHeight.receive(on: DispatchQueue.main).sink { [weak self] v in self?.os.displayHeight = v }.store(in: &cancellables)
+        ble.$displayDistance.receive(on: DispatchQueue.main).sink { [weak self] v in self?.os.displayDistance = v }.store(in: &cancellables)
+        ble.$wearDetection.receive(on: DispatchQueue.main).sink { [weak self] v in self?.os.wearDetection = v }.store(in: &cancellables)
+        ble.$silentMode.receive(on: DispatchQueue.main).sink { [weak self] v in self?.os.silentMode = v }.store(in: &cancellables)
+        ble.$firmwareLeft.receive(on: DispatchQueue.main).sink { [weak self] v in self?.os.g2FirmwareLeft = v }.store(in: &cancellables)
+        ble.$firmwareRight.receive(on: DispatchQueue.main).sink { [weak self] v in self?.os.g2FirmwareRight = v }.store(in: &cancellables)
         ble.$phase
             .receive(on: DispatchQueue.main)
             .sink { [weak self] phase in
@@ -347,16 +390,8 @@ public final class AppCoordinator: ObservableObject {
                 }
             }
             .store(in: &cancellables)
-
-        flic.$isReady
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] ready in self?.os.flicConnected = ready }
-            .store(in: &cancellables)
-
-        flic.$batteryVoltage
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] v in self?.os.flicVoltage = v }
-            .store(in: &cancellables)
+        flic.$isReady.receive(on: DispatchQueue.main).sink { [weak self] v in self?.os.flicConnected = v }.store(in: &cancellables)
+        flic.$batteryVoltage.receive(on: DispatchQueue.main).sink { [weak self] v in self?.os.flicVoltage = v }.store(in: &cancellables)
     }
 
     public func appendLog(_ message: String) {

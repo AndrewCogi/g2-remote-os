@@ -12,6 +12,8 @@ struct MotionPadFullscreenView: View {
     @EnvironmentObject var coordinator: AppCoordinator
     @EnvironmentObject var ble: G2BLEManager
     @EnvironmentObject var os: G2OSStateMachine
+    @EnvironmentObject var spark: SparkBridgeClient
+    @EnvironmentObject var tailscale: TailscaleMonitor
 
     @State private var showMiniMirror: Bool = false
     @State private var activeTouchPoint: CGPoint?
@@ -151,6 +153,9 @@ struct MotionPadFullscreenView: View {
                         .font(.caption.monospacedDigit())
                         .foregroundColor(.white.opacity(0.45))
                 }
+                Text("· \(tailscale.isTailscaleConnected ? (spark.isConnected ? "TS●" : "TS○") : "TS✕")")
+                    .font(.caption2.monospaced())
+                    .foregroundColor(tailscale.isTailscaleConnected ? (spark.isConnected ? .green : .orange) : .white.opacity(0.35))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 7)

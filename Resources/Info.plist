@@ -61,6 +61,15 @@
 	<string>G2 대시보드에 오늘의 걸음 수와 이동 거리를 표시하기 위해 동작 및 피트니스 권한이 필요합니다.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>무료 온디바이스 음성인식(받아쓰기·통역·AI 대화)을 위해 음성 인식 권한이 필요합니다.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>tailscale</string>
+	</array>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>

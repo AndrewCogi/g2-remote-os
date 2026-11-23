@@ -29,6 +29,8 @@ struct G2RemoteOSApp: App {
                 .environmentObject(coordinator.calendar)
                 .environmentObject(coordinator.pedometer)
                 .environmentObject(coordinator.clockTools)
+                .environmentObject(coordinator.spark)
+                .environmentObject(coordinator.tailscale)
                 .preferredColorScheme(.dark)
         }
     }

@@ -135,10 +135,11 @@ final class G2ProtocolTests: XCTestCase {
         XCTAssertEqual(os.currentPage.textContainers.count, 7) // header + 6 bordered app cards
         XCTAssertEqual(os.currentPage.textContainers.filter(\.captureEvents).count, 1)
 
-        // 4. Navigate to Hardware Settings (row 1, col 2) and adjust brightness + display height
-        os.handle(RemoteCommandEvent(action: .down, source: .motionPad))
+        // 4. Navigate to Hardware Settings on Launcher Page 2 (row 0, col 1 after wrapping right past col 2)
         os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
         os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
+        os.handle(RemoteCommandEvent(action: .right, source: .motionPad)) // Page 1, col 0 (HeadUp)
+        os.handle(RemoteCommandEvent(action: .right, source: .motionPad)) // Page 1, col 1 (Settings)
         os.handle(RemoteCommandEvent(action: .select, source: .motionPad))
         XCTAssertEqual(os.currentScreen, .settings)
         os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
@@ -160,13 +161,26 @@ final class G2ProtocolTests: XCTestCase {
         XCTAssertFalse(os.isHeadUpDimmed)
         XCTAssertEqual(os.currentScreen, .dashboard)
 
-        // 6. Global Push-to-Talk mic open / close (idempotent)
+        // 6. Tailscale & Spark node badge displays on glasses
+        os.tailscaleConnected = true
+        os.handleSparkEvent(.connected(host: "spark01", latencyMs: 18, sttModel: "large-v3-turbo"))
+        XCTAssertTrue(os.renderedFrameText.contains("TS●64"))
+
+        // 7. Global Push-to-Talk -> Even AI streaming flow
         os.handle(RemoteCommandEvent(action: .micStart, source: .motionPad))
         os.handle(RemoteCommandEvent(action: .micStart, source: .motionPad))
         XCTAssertTrue(os.isMicOn)
+        os.handleSparkEvent(.sttPartial(mode: .evenAI, text: "내일 서울 날씨", elapsedMs: 90))
+        XCTAssertTrue(os.renderedFrameText.contains("내일 서울 날씨"))
+
         os.handle(RemoteCommandEvent(action: .micStop, source: .motionPad))
         os.handle(RemoteCommandEvent(action: .micStop, source: .motionPad))
         XCTAssertFalse(os.isMicOn)
         XCTAssertEqual(micEvents, [true, false])
+
+        os.handleSparkEvent(.sttFinal(mode: .evenAI, text: "내일 서울 날씨 알려줘", language: "ko", elapsedMs: 115))
+        os.handleSparkEvent(.aiDone(mode: .evenAI, text: "내일 서울은 맑고 최고 16도입니다.", commands: [], durationSeconds: 1.1))
+        XCTAssertEqual(os.currentScreen, .agent)
+        XCTAssertTrue(os.renderedFrameText.contains("최고 16도"))
     }
 }

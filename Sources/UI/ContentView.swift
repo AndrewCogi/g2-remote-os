@@ -12,6 +12,8 @@ struct ContentView: View {
     @EnvironmentObject var keeper: BackgroundKeeper
     @EnvironmentObject var calendar: CalendarQuickListService
     @EnvironmentObject var clockTools: AlarmTimerService
+    @EnvironmentObject var spark: SparkBridgeClient
+    @EnvironmentObject var tailscale: TailscaleMonitor
 
     @State private var showMotionPad = false
     @State private var showConnectionSheet = false
@@ -69,6 +71,8 @@ struct ContentView: View {
                 .environmentObject(flic)
                 .environmentObject(os)
                 .environmentObject(keeper)
+                .environmentObject(spark)
+                .environmentObject(tailscale)
         }
         .sheet(isPresented: $showConnectionSheet) {
             NavigationStack {
@@ -98,6 +102,8 @@ struct ContentView: View {
             .environmentObject(os)
             .environmentObject(keeper)
             .environmentObject(calendar)
+            .environmentObject(spark)
+            .environmentObject(tailscale)
             .preferredColorScheme(.dark)
         }
     }
@@ -380,22 +386,32 @@ struct ContentView: View {
             Image(systemName: coordinator.keepAliveEnabled ? "lock.shield.fill" : "lock.open")
                 .font(.caption2)
                 .foregroundColor(coordinator.keepAliveEnabled ? .green : .orange)
-            Text(os.headUpWakeEnabled ? "항시 OS 유지 · 들어깨우기 ON" : (coordinator.keepAliveEnabled ? "항시 G2 OS 유지 중" : "항시 유지 꺼짐"))
+            Text(os.headUpWakeEnabled ? "항시 OS · 들기 ON" : (coordinator.keepAliveEnabled ? "항시 OS 유지" : "항시 유지 꺼짐"))
                 .font(.caption2)
                 .foregroundColor(.white.opacity(0.5))
 
             Spacer()
 
-            if flic.isReady {
-                Text("Flic 연결됨")
-                    .font(.caption2.weight(.medium))
-                    .foregroundColor(.green.opacity(0.85))
-            } else {
-                Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3")")
-                    .font(.caption2.monospaced())
-                    .foregroundColor(.white.opacity(0.32))
+            Button {
+                showSettingsSheet = true
+            } label: {
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(tailscale.isTailscaleConnected ? (spark.isConnected ? Color.green : Color.orange) : Color.gray)
+                        .frame(width: 6, height: 6)
+                    Text(tailscaleFooterText)
+                        .font(.caption2.monospaced())
+                        .foregroundColor(tailscale.isTailscaleConnected ? .white.opacity(0.75) : .white.opacity(0.4))
+                }
             }
+            .buttonStyle(.plain)
         }
         .padding(.horizontal, 4)
+    }
+
+    private var tailscaleFooterText: String {
+        if !tailscale.isTailscaleConnected { return "TS OFF" }
+        if spark.isConnected { return "\(spark.activeNodeLabel) · \(spark.latencyMs)ms" }
+        return "TS ON · 대기"
     }
 }

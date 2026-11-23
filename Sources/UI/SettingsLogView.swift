@@ -7,8 +7,11 @@ struct SettingsLogView: View {
     @EnvironmentObject var os: G2OSStateMachine
     @EnvironmentObject var keeper: BackgroundKeeper
     @EnvironmentObject var calendar: CalendarQuickListService
+    @EnvironmentObject var spark: SparkBridgeClient
+    @EnvironmentObject var tailscale: TailscaleMonitor
 
     @State private var showLogs: Bool = false
+    @State private var testPromptText: String = ""
 
     private var appVersionText: String {
         let short = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.0"
@@ -18,6 +21,95 @@ struct SettingsLogView: View {
 
     var body: some View {
         List {
+            Section {
+                HStack {
+                    Text("Tailscale VPN")
+                    Spacer()
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(tailscale.isTailscaleConnected ? Color.green : Color.red)
+                            .frame(width: 8, height: 8)
+                        Text(tailscale.isTailscaleConnected ? "연결됨 (\(tailscale.tailscaleIPv4 ?? ""))" : "꺼짐")
+                            .font(.caption.monospaced())
+                            .foregroundColor(tailscale.isTailscaleConnected ? .green : .red)
+                    }
+                }
+
+                HStack {
+                    Text("DGX Spark 브릿지")
+                    Spacer()
+                    Text(spark.isConnected ? "\(spark.activeNodeLabel) · \(spark.latencyMs)ms" : spark.activeNodeLabel)
+                        .font(.caption.monospaced())
+                        .foregroundColor(spark.isConnected ? .green : .secondary)
+                }
+
+                HStack {
+                    Text("1순위 (spark01)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    TextField("100.101.25.64:8765", text: $spark.primaryEndpoint)
+                        .font(.caption.monospaced())
+                        .multilineTextAlignment(.trailing)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                }
+
+                HStack {
+                    Text("2순위 (spark02)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    TextField("100.101.25.65:8765", text: $spark.fallbackEndpoint)
+                        .font(.caption.monospaced())
+                        .multilineTextAlignment(.trailing)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                }
+
+                Picker("agy 추론 속도", selection: $spark.effort) {
+                    Text("초고속 (low)").tag("low")
+                    Text("균형 (medium)").tag("medium")
+                    Text("심층 (high)").tag("high")
+                }
+
+                HStack(spacing: 10) {
+                    Button(spark.isConnecting ? "연결 중..." : "Spark 연결/재시도") {
+                        tailscale.refresh()
+                        spark.disconnect()
+                        spark.connectWithFailover()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(spark.isConnecting)
+
+                    if let tsURL = URL(string: "tailscale://"), !tailscale.isTailscaleConnected {
+                        Button("Tailscale 열기") {
+                            UIApplication.shared.open(tsURL)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+
+                HStack {
+                    TextField("Even AI 텍스트 테스트 질문...", text: $testPromptText)
+                        .font(.caption)
+                    Button("전송") {
+                        spark.sendTextPrompt(mode: .evenAI, text: testPromptText)
+                        testPromptText = ""
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(testPromptText.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+
+                if let err = spark.lastError {
+                    Text(err)
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                }
+            } header: {
+                Text("Tailscale & DGX Spark AI (agy)")
+            } footer: {
+                Text("폰에서 Tailscale을 켜면 자동으로 감지되어 spark01(64) → 실패 시 spark02(65)로 자동 연결되며, G2 안경 상단에도 상태(TS●64 / TS●65 / TS✕)가 실시간 표시됩니다.")
+            }
+
             Section {
                 Toggle("항시 G2 OS 유지 (기존 OS 복귀 차단)", isOn: $coordinator.keepAliveEnabled)
 
