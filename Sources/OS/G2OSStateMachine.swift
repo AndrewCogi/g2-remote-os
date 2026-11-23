@@ -1,12 +1,61 @@
 import Foundation
 
-/// Full-featured Even Realities G2 OS state machine rendered onto the 576x288 EvenHub canvas
-/// using multi-container bordered cards + 4-bit pixel graphics + real-time DGX Spark `agy` AI suite.
+public struct G2AlertItem: Identifiable, Equatable {
+    public let id: String
+    public let source: String
+    public let sender: String
+    public let timeLabel: String
+    public let preview: String
+    public let bodyLines: [String]
+
+    public init(id: String, source: String, sender: String, timeLabel: String, preview: String, bodyLines: [String]) {
+        self.id = id
+        self.source = source
+        self.sender = sender
+        self.timeLabel = timeLabel
+        self.preview = preview
+        self.bodyLines = bodyLines
+    }
+
+    public static let defaults: [G2AlertItem] = [
+        G2AlertItem(
+            id: "a1",
+            source: "kakao",
+            sender: "김민수",
+            timeLabel: "방금",
+            preview: "오늘 3시 미팅 30분 뒤로 미뤄도 될까요? 자료는 노션에 올려뒀습니다.",
+            bodyLines: [
+                "오늘 3시 미팅 30분 뒤로 미뤄도 될까요?",
+                "디자인 리뷰 자료는 노션에 미리 올려뒀습니다.",
+                "혹시 G2 안경 실기 테스트도 같이 볼 수 있나요?"
+            ]
+        ),
+        G2AlertItem(
+            id: "a2",
+            source: "agy",
+            sender: "agy · spark01",
+            timeLabel: "2분 전",
+            preview: "DGX Spark GPU 준비 완료 · 오늘 관심 피드가 업데이트되었습니다.",
+            bodyLines: [
+                "1. DGX Spark 상태 (Tailscale 정상)",
+                "   • spark01 (GB10 GPU): Whisper turbo 활성",
+                "   • spark02 (폴백 대기): 활성",
+                "2. 오늘 관심 피드가 준비되었습니다."
+            ]
+        )
+    ]
+}
+
+/// Minimalist Even Realities G2 Spatial OS state machine rendered onto the 576x288 EvenHub canvas
+/// with CoreGraphics 4-bit graphics + fast differential multi-container updates.
 public final class G2OSStateMachine: ObservableObject {
     public enum Screen: String, CaseIterable {
-        case dashboard = "대시보드"
-        case launcher = "앱 메뉴"
-        case agent = "Even AI"
+        case dashboard = "바탕화면"
+        case alerts = "알림 피드"
+        case launcher = "메뉴"
+        case feedApp = "피드"
+        case readerDetail = "상세 보기"
+        case agent = "AI 답변"
         case quickList = "QuickList"
         case clockTools = "알람·타이머"
         case teleprompter = "텔레프롬프터"
@@ -59,7 +108,25 @@ public final class G2OSStateMachine: ObservableObject {
     @Published public private(set) var recentActions: [String] = []
     @Published public private(set) var toastMessage: String?
 
-    // Dashboard right-side widget tab (0 = Calendar, 1 = QuickList, 2 = Timer & System)
+    // Studio Minimalist Spatial OS State (Home -> ↓ Alerts / → Menu 8-Slot Dock -> Feed App & Reader)
+    @Published public var feedCategories: [G2FeedCategory] = FeedService.defaultCategories()
+    @Published public var feedSearchQuery: String = ""
+    @Published public private(set) var alerts: [G2AlertItem] = G2AlertItem.defaults
+    @Published public private(set) var alertStackIdx: Int = 0
+    @Published public private(set) var menuSlotIdx: Int = 0        // 0..7 (0 = 피드, 1..7 = empty)
+    @Published public private(set) var menuFocus: Int = -1         // -1 = Bottom Dock, 0..N-1 = Quick Preview (↑ enter/exit)
+    @Published public private(set) var feedCatIdx: Int = 0
+    @Published public private(set) var feedCatFocus: Int = 0
+    private var readerSourceIsAlert: Bool = false
+    private var activeArticleId: String = ""
+    private var detailScroll: Int = 0
+    private var readerReturnScreen: Screen = .launcher
+    private var aiReturnScreen: Screen = .dashboard
+    private var voiceSearchCaptureActive: Bool = false
+
+    public var onFeedVoiceSearch: ((String) -> Void)?
+
+    // Dashboard right-side widget tab (legacy compatibility)
     @Published public private(set) var dashboardTab: Int = 0
 
     // App Launcher 3x2 card grid (page 0..1, row 0..1, col 0..2)
@@ -361,6 +428,18 @@ public final class G2OSStateMachine: ObservableObject {
             switch mode {
             case .evenAI, .transcribe:
                 aiLivePartialSTT = ""
+                if voiceSearchCaptureActive {
+                    voiceSearchCaptureActive = false
+                    if !trimmed.isEmpty {
+                        feedSearchQuery = trimmed
+                        onFeedVoiceSearch?(trimmed)
+                        feedCatIdx = max(0, feedCategories.count - 1)
+                        feedCatFocus = 0
+                        currentScreen = .feedApp
+                    }
+                    rebuildDisplay(pushToGlasses: true)
+                    return
+                }
                 if trimmed.isEmpty {
                     aiLiveStatus = "음성이 감지되지 않았습니다"
                 } else {
@@ -369,7 +448,8 @@ public final class G2OSStateMachine: ObservableObject {
                     if aiTurns.count > 12 { aiTurns.removeFirst() }
                     aiTurnIndex = aiTurns.count - 1
                     aiScrollOffset = 0
-                    aiLiveStatus = "agy 생각 중..."
+                    aiLiveStatus = "생각 중..."
+                    if currentScreen != .agent { aiReturnScreen = currentScreen }
                     currentScreen = .agent
                 }
                 rebuildDisplay(pushToGlasses: true)
@@ -599,9 +679,14 @@ public final class G2OSStateMachine: ObservableObject {
 
         if isMicOn && !isTranslateActive && !isConversateActive { return }
 
+        let isRepeat = event.detail.contains("연속")
+
         switch currentScreen {
         case .dashboard: handleDashboard(event.action)
-        case .launcher: handleLauncher(event.action)
+        case .alerts: handleAlerts(event.action, isRepeat: isRepeat)
+        case .launcher: handleLauncher(event.action, isRepeat: isRepeat)
+        case .feedApp: handleFeedApp(event.action)
+        case .readerDetail: handleReaderDetail(event.action)
         case .agent: handleAgent(event.action)
         case .translate: handleTranslate(event.action)
         case .conversate: handleConversate(event.action)
@@ -634,7 +719,11 @@ public final class G2OSStateMachine: ObservableObject {
             micDurationMs = 0
             micSignal = 0
             aiLivePartialSTT = ""
-            activePushToTalkMode = (currentScreen == .translate) ? .translate : .evenAI
+            voiceSearchCaptureActive = (currentScreen == .feedApp)
+            if !voiceSearchCaptureActive && currentScreen != .agent {
+                aiReturnScreen = currentScreen
+            }
+            activePushToTalkMode = voiceSearchCaptureActive ? .transcribe : ((currentScreen == .translate) ? .translate : .evenAI)
 
             let pair = translatePairs[translatePairIndex]
             let src = activePushToTalkMode == .translate ? pair.src : "auto"
@@ -654,12 +743,12 @@ public final class G2OSStateMachine: ObservableObject {
             if capturedPackets > 0 {
                 onSaveMicRecording?()
                 lastVoiceSummary = String(format: "최근 음성 %.1f초 (%d pkt)", capturedSec, capturedPackets)
-                if activePushToTalkMode == .evenAI {
+                if activePushToTalkMode == .evenAI && !voiceSearchCaptureActive {
                     currentScreen = .agent
-                    aiLiveStatus = "음성 인식 중..."
+                    aiLiveStatus = "인식 중..."
                 }
             } else {
-                showToast("마이크 종료")
+                voiceSearchCaptureActive = false
             }
             rebuildDisplay()
         }
@@ -694,42 +783,96 @@ public final class G2OSStateMachine: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
     }
 
-    // MARK: - Per-Screen Handlers
+    // MARK: - Studio Minimalist Per-Screen Handlers
 
+    private func recommendedArticles() -> [G2FeedArticle] {
+        feedCategories.first?.articles ?? []
+    }
+
+    private func currentCategoryArticles() -> [G2FeedArticle] {
+        guard !feedCategories.isEmpty else { return [] }
+        let idx = max(0, min(feedCategories.count - 1, feedCatIdx))
+        return feedCategories[idx].articles
+    }
+
+    private func findArticle(id: String) -> G2FeedArticle? {
+        for cat in feedCategories {
+            if let hit = cat.articles.first(where: { $0.id == id }) { return hit }
+        }
+        return recommendedArticles().first
+    }
+
+    // 1. Home (`↓` Alerts/Feed | `→` Menu | `L2` Direct Open)
     private func handleDashboard(_ action: RemoteAction) {
+        let hasAlerts = !alerts.isEmpty
         switch action {
-        case .left: dashboardTab = (dashboardTab + 2) % 3
-        case .right: dashboardTab = (dashboardTab + 1) % 3
-        case .down, .scrollDown, .select: currentScreen = .launcher
+        case .down, .scrollDown:
+            if hasAlerts {
+                alertStackIdx = 0
+                currentScreen = .alerts
+            } else {
+                feedCatIdx = 0
+                feedCatFocus = 0
+                currentScreen = .feedApp
+            }
+        case .right:
+            menuSlotIdx = 0
+            menuFocus = -1
+            currentScreen = .launcher
+        case .select:
+            detailScroll = 0
+            readerReturnScreen = .dashboard
+            if hasAlerts {
+                readerSourceIsAlert = true
+                alertStackIdx = 0
+                currentScreen = .readerDetail
+            } else if let first = recommendedArticles().first {
+                readerSourceIsAlert = false
+                activeArticleId = first.id
+                currentScreen = .readerDetail
+            }
         case .up, .scrollUp:
             onRefreshDataServices?()
             onQuerySettings?()
-            showToast("대시보드 새로고침")
-        case .back: break
-        default: break
+        case .back:
+            break
+        default:
+            break
         }
     }
 
-    private func handleLauncher(_ action: RemoteAction) {
+    // 2. Alerts Stack (`↑↓` move, top `↑` -> Home | `←` dismiss 1 | `L2` open/clear | `R2` Home)
+    private func handleAlerts(_ action: RemoteAction, isRepeat: Bool) {
+        let count = alerts.count
         switch action {
-        case .up, .scrollUp, .down, .scrollDown:
-            launcherRow = (launcherRow + 1) % 2
-        case .left:
-            if launcherCol > 0 { launcherCol -= 1 }
-            else {
-                launcherPage = (launcherPage + launcherPages.count - 1) % launcherPages.count
-                launcherCol = 2
+        case .down, .scrollDown:
+            if count > 0 && alertStackIdx < count {
+                alertStackIdx += 1
             }
-        case .right:
-            if launcherCol < 2 { launcherCol += 1 }
-            else {
-                launcherPage = (launcherPage + 1) % launcherPages.count
-                launcherCol = 0
+        case .up, .scrollUp:
+            if alertStackIdx > 0 {
+                alertStackIdx -= 1
+            } else if !isRepeat {
+                currentScreen = .dashboard
+            }
+        case .left:
+            if !isRepeat && count > 0 && alertStackIdx < count {
+                alerts.remove(at: alertStackIdx)
+                if alertStackIdx > alerts.count { alertStackIdx = alerts.count }
+                if alerts.isEmpty { alertStackIdx = 0 }
             }
         case .select:
-            let target = launcherPages[launcherPage][launcherRow][launcherCol].screen
-            currentScreen = target
-            if target == .settings || target == .dashboard { onQuerySettings?() }
+            guard count > 0 else { return }
+            if alertStackIdx == count {
+                alerts.removeAll()
+                alertStackIdx = 0
+                currentScreen = .dashboard
+            } else {
+                readerSourceIsAlert = true
+                detailScroll = 0
+                readerReturnScreen = .alerts
+                currentScreen = .readerDetail
+            }
         case .back:
             currentScreen = .dashboard
         default:
@@ -737,34 +880,135 @@ public final class G2OSStateMachine: ObservableObject {
         }
     }
 
+    // 3. Menu Preview (8 Slots: Dock `menuFocus=-1` -> `↑` enters Quick Preview, `L2` opens Full Feed!)
+    private func handleLauncher(_ action: RemoteAction, isRepeat: Bool) {
+        let slotCount = 8
+        let rec = recommendedArticles()
+        let isFeedSlot = (menuSlotIdx == 0)
+
+        switch action {
+        case .right:
+            if menuSlotIdx < slotCount - 1 {
+                menuSlotIdx += 1
+                menuFocus = -1
+            }
+        case .left:
+            if menuSlotIdx > 0 {
+                menuSlotIdx -= 1
+                menuFocus = -1
+            } else if !isRepeat {
+                currentScreen = .dashboard
+            }
+        case .up, .scrollUp:
+            guard isFeedSlot && !rec.isEmpty else { return }
+            if menuFocus < 0 {
+                if !isRepeat { menuFocus = 0 }
+            } else if menuFocus > 0 {
+                menuFocus -= 1
+            } else if !isRepeat {
+                menuFocus = -1
+            }
+        case .down, .scrollDown:
+            guard isFeedSlot && !rec.isEmpty else { return }
+            if menuFocus >= 0 && menuFocus < rec.count - 1 {
+                menuFocus += 1
+            }
+        case .select:
+            guard isFeedSlot else { return }
+            if menuFocus < 0 {
+                feedCatIdx = 0
+                feedCatFocus = 0
+                currentScreen = .feedApp
+            } else {
+                let idx = max(0, min(rec.count - 1, menuFocus))
+                readerSourceIsAlert = false
+                activeArticleId = rec[idx].id
+                detailScroll = 0
+                readerReturnScreen = .launcher
+                currentScreen = .readerDetail
+            }
+        case .back:
+            if menuFocus >= 0 {
+                menuFocus = -1
+            } else {
+                currentScreen = .dashboard
+            }
+        default:
+            break
+        }
+    }
+
+    // 4. Full-Screen Feed (`←→` categories | `↑↓` articles | `L2` read | `L2 꾹` voice search | `R2` menu)
+    private func handleFeedApp(_ action: RemoteAction) {
+        let items = currentCategoryArticles()
+        switch action {
+        case .right:
+            if feedCatIdx < feedCategories.count - 1 {
+                feedCatIdx += 1
+                feedCatFocus = 0
+            }
+        case .left:
+            if feedCatIdx > 0 {
+                feedCatIdx -= 1
+                feedCatFocus = 0
+            }
+        case .down, .scrollDown:
+            if feedCatFocus < items.count - 1 { feedCatFocus += 1 }
+        case .up, .scrollUp:
+            if feedCatFocus > 0 { feedCatFocus -= 1 }
+        case .select:
+            guard !items.isEmpty else { return }
+            let idx = max(0, min(items.count - 1, feedCatFocus))
+            readerSourceIsAlert = false
+            activeArticleId = items[idx].id
+            detailScroll = 0
+            readerReturnScreen = .feedApp
+            currentScreen = .readerDetail
+        case .back:
+            menuFocus = -1
+            currentScreen = .launcher
+        default:
+            break
+        }
+    }
+
+    // 5. Article / Alert Full Reader (`↑↓` scroll | `R2` back)
+    private func handleReaderDetail(_ action: RemoteAction) {
+        let lines = currentReaderLines()
+        let maxScroll = max(0, lines.count - 6)
+        switch action {
+        case .down, .scrollDown:
+            if detailScroll < maxScroll { detailScroll += 1 }
+        case .up, .scrollUp:
+            if detailScroll > 0 { detailScroll -= 1 }
+        case .back:
+            currentScreen = readerReturnScreen
+        default:
+            break
+        }
+    }
+
+    private func currentReaderLines() -> [String] {
+        if readerSourceIsAlert {
+            guard !alerts.isEmpty else { return [] }
+            let idx = max(0, min(alerts.count - 1, alertStackIdx))
+            return alerts[idx].bodyLines
+        }
+        guard let art = findArticle(id: activeArticleId) else { return [] }
+        return [art.title, ""] + art.bodyLines
+    }
+
+    // 6. AI Reply (`↑↓` scroll | `R2` return to previous screen)
     private func handleAgent(_ action: RemoteAction) {
         let lines = currentAIAnswerLines()
-        let maxOffset = max(0, lines.count - 4)
+        let maxOffset = max(0, lines.count - 5)
         switch action {
         case .up, .scrollUp:
             aiScrollOffset = max(0, aiScrollOffset - 1)
         case .down, .scrollDown:
             aiScrollOffset = min(maxOffset, aiScrollOffset + 1)
-        case .left:
-            if !aiTurns.isEmpty {
-                aiTurnIndex = max(0, aiTurnIndex - 1)
-                aiScrollOffset = 0
-            }
-        case .right:
-            if !aiTurns.isEmpty {
-                aiTurnIndex = min(aiTurns.count - 1, aiTurnIndex + 1)
-                aiScrollOffset = 0
-            }
-        case .select:
-            // Reset to fresh Even AI session
-            aiTurns.removeAll()
-            aiTurnIndex = 0
-            aiScrollOffset = 0
-            aiLiveStatus = "새 대화 시작 · 길게 눌러 질문하세요"
-            onResetVoiceSession?(.evenAI)
-            showToast("Even AI 새 대화 초기화")
         case .back:
-            currentScreen = .launcher
+            currentScreen = aiReturnScreen
         default:
             break
         }
@@ -1072,7 +1316,10 @@ public final class G2OSStateMachine: ObservableObject {
         } else {
             switch currentScreen {
             case .dashboard: page = buildDashboardPage()
+            case .alerts: page = buildAlertsPage()
             case .launcher: page = buildLauncherPage()
+            case .feedApp: page = buildFeedAppPage()
+            case .readerDetail: page = buildReaderDetailPage()
             case .agent: page = buildEvenAIPage()
             case .translate: page = buildTranslatePage()
             case .conversate: page = buildConversatePage()
@@ -1084,9 +1331,9 @@ public final class G2OSStateMachine: ObservableObject {
             case .navigate:
                 page = buildStandardScreenPage(
                     layoutKey: "screen_navigate",
-                    title: "길찾기 (Navigate)",
-                    bodyLines: ["", "  MapKit 도보 턴바이턴 + 4-bit 미니맵", "  다음 업데이트(v0.5)에 탑재 예정입니다."],
-                    footer: "더블탭: 앱 메뉴"
+                    title: "길찾기",
+                    bodyLines: ["", "  도보 턴바이턴 준비 중"],
+                    footer: ""
                 )
             }
         }
@@ -1127,169 +1374,385 @@ public final class G2OSStateMachine: ObservableObject {
         return "\(formattedClock())  \(title)\(headTag)  \(glassesTailscaleBadge()) \(bat)"
     }
 
-    // 1. Stock-Style Dashboard
+    private func formattedCompactDate() -> String {
+        let df = DateFormatter()
+        df.dateFormat = "MM.dd E"
+        df.locale = Locale(identifier: "ko_KR")
+        return df.string(from: Date())
+    }
+
+    private func formattedTempOnly() -> String {
+        if let w = weather {
+            return "\(w.temperatureC)°"
+        }
+        return "--°"
+    }
+
+    private func clipVisual(_ text: String, maxUnits: Int) -> String {
+        var out = ""
+        var units = 0
+        for ch in text {
+            let w = ch.isASCII ? 1 : 2
+            if units + w > maxUnits {
+                return out + "…"
+            }
+            out.append(ch)
+            units += w
+        }
+        return out
+    }
+
+    private func topStatusImage() -> G2ImageContainer {
+        G2StudioGraphics.makeTopStatusImage(
+            tailscaleOn: tailscaleConnected,
+            sparkConnected: sparkConnected,
+            batteryPercent: g2Battery ?? 85,
+            charging: g2Charging
+        )
+    }
+
+    // 1. Studio Minimalist Home (`21:32` giant centered clock + `11.23 월 · ☀ 14°` + bottom peek pill)
     private func buildDashboardPage() -> G2PageSpec {
         let timeStr = formattedClock()
         lastClockMinute = timeStr
-        let batVal = g2Battery ?? 80
-        let weatherLine = weather?.compactLine ?? "날씨 확인 중..."
-        let alarmLine = nextAlarm.map { "알람 \($0.timeText)" } ?? "알람 없음"
-        let timerTag = isTimerRunning ? " · 타이머 \(AlarmTimerService.formatDuration(timerRemainingSeconds))" : ""
+        let dateStr = formattedCompactDate()
+        let tempStr = formattedTempOnly()
+        let weatherCode = weather?.iconCode ?? "sun"
 
-        var images: [G2ImageContainer] = []
-        let leftInfoY: Int
-        let leftInfoH: Int
-        let leftInfoText: String
+        var images: [G2ImageContainer] = [topStatusImage()]
+        var containers: [G2TextContainer] = []
 
         if pixelGraphicsEnabled {
-            let canvas = G2PixelCanvas(width: 244, height: 64)
-            canvas.drawBigClock(timeStr, originX: 4, originY: 8, digitW: 24, digitH: 46, thickness: 5, spacing: 7, level: 15)
-            canvas.drawWeatherIcon(code: weather?.iconCode ?? "cloud", cx: 196, cy: 24)
-            canvas.drawBatteryBar(x: 176, y: 48, w: 48, h: 12, percent: batVal)
-
-            let hash = "\(timeStr)_\(weather?.iconCode ?? "c")_\(batVal / 5)"
             images.append(
-                G2ImageContainer(id: 10, name: "clk", x: 14, y: 10, width: 244, height: 64, packed4bpp: canvas.pack4bpp(), contentHash: hash)
+                G2StudioGraphics.makeHomeClockImage(
+                    timeStr: timeStr,
+                    dateStr: dateStr,
+                    tempStr: tempStr,
+                    weatherCode: weatherCode
+                )
             )
-            leftInfoY = 80
-            leftInfoH = 128
-            leftInfoText = [
-                "\(formattedDateKo())  \(glassesTailscaleBadge())",
-                weatherLine,
-                "걸음 \(todaySteps)보 (\(todayDistanceKm))",
-                "G2 \(g2Battery.map { "\($0)%" } ?? "--%") · \(alarmLine)"
-            ].joined(separator: "\n")
         } else {
-            leftInfoY = 12
-            leftInfoH = 196
-            leftInfoText = [
-                "\(timeStr)  \(formattedDateKo())",
-                "────────────────",
-                weatherLine,
-                "걸음 \(todaySteps)보 · \(glassesTailscaleBadge())",
-                "G2 \(g2Battery.map { "\($0)%" } ?? "--%") · \(alarmLine)"
-            ].joined(separator: "\n")
+            containers.append(
+                G2TextContainer(
+                    id: 2, name: "txtclk", x: 144, y: 42, width: 288, height: 112,
+                    text: "        \(timeStr)\n\n      \(dateStr) · \(tempStr)",
+                    captureEvents: false, padding: 6
+                )
+            )
         }
 
-        let rightTitle: String
-        let rightBody: [String]
-        switch dashboardTab {
-        case 0:
-            rightTitle = "● 일정  ○ 할일  ○ 상태"
-            if calendarEvents.isEmpty {
-                rightBody = ["", "예정된 일정이 없습니다.", "도구에서 캘린더를 연동하세요."]
-            } else {
-                rightBody = calendarEvents.prefix(4).map { "\($0.timeLabel) \($0.title)" }
-            }
-        case 1:
-            rightTitle = "○ 일정  ● 할일  ○ 상태"
-            let pending = quickTasks.filter { !$0.isCompleted }
-            if pending.isEmpty {
-                rightBody = ["", "모든 할 일을 완료했습니다!"]
-            } else {
-                rightBody = pending.prefix(4).map { "□ \($0.title)" }
-            }
-        default:
-            rightTitle = "○ 일정  ○ 할일  ● 상태"
-            let tsLine = tailscaleConnected ? "Tailscale: ON (\(sparkNodeStatus))" : "Tailscale: OFF (폰에서 켜기)"
-            rightBody = [
-                tsLine,
-                "타이머: \(AlarmTimerService.formatDuration(timerRemainingSeconds)) \(isTimerRunning ? "진행중" : "대기")",
-                "들어깨우기: \(headUpWakeEnabled ? "ON (\(headUpTriggerAngle)°)" : "OFF")",
-                "리모콘: \(flicConnected ? "Flic 연결됨" : "모션 패드")"
-            ]
+        let hasAlerts = !alerts.isEmpty
+        let rec = recommendedArticles()
+        let count = hasAlerts ? alerts.count : rec.count
+
+        let peekText: String
+        if hasAlerts, let first = alerts.first {
+            let extra = count > 1 ? "   +\(count - 1)" : ""
+            let msg = clipVisual(first.preview, maxUnits: 34)
+            peekText = "\(first.sender)  \(msg)\(extra)"
+        } else if let first = rec.first {
+            let extra = count > 1 ? "   +\(count - 1)" : ""
+            let msg = clipVisual(first.title, maxUnits: 34)
+            peekText = "✦ \(first.category)  \(msg)\(extra)"
+        } else {
+            peekText = " "
         }
 
-        let rightText = ([rightTitle, "────────────────────"] + rightBody).joined(separator: "\n")
-        let dockText = toastMessage.map { "· \($0)   [탭: 앱 메뉴]" }
-            ?? "◀ 좌/우 위젯 ▶  |  탭: 앱 메뉴  |  홀드: Even AI\(timerTag)"
+        containers.append(
+            G2TextContainer(
+                id: 1, name: "peek", x: 40, y: 198, width: 496, height: 52,
+                text: peekText,
+                captureEvents: true,
+                borderWidth: count > 0 ? 1 : 0,
+                borderColor: hasAlerts ? 10 : 7,
+                borderRadius: 10,
+                padding: 12
+            )
+        )
 
-        let containers: [G2TextContainer] = [
-            G2TextContainer(id: 1, name: "rightcard", x: 268, y: 12, width: 296, height: 196, text: rightText, captureEvents: true, borderWidth: 1, borderColor: 8, borderRadius: 8, padding: 8),
-            G2TextContainer(id: 2, name: "leftinfo", x: 12, y: leftInfoY, width: 248, height: leftInfoH, text: leftInfoText, captureEvents: false, borderWidth: 1, borderColor: 5, borderRadius: 8, padding: 7),
-            G2TextContainer(id: 3, name: "dock", x: 12, y: 218, width: 552, height: 58, text: dockText, captureEvents: false, borderWidth: 1, borderColor: 12, borderRadius: 8, padding: 8)
-        ]
-
-        return G2PageSpec(layoutKey: pixelGraphicsEnabled ? "dashboard_gfx" : "dashboard_txt", textContainers: containers, imageContainers: images)
+        return G2PageSpec(
+            layoutKey: pixelGraphicsEnabled ? "studio_home_gfx" : "studio_home_txt",
+            textContainers: containers,
+            imageContainers: images,
+            summaryText: "\(timeStr) \(dateStr) \(tempStr)\n\(peekText)"
+        )
     }
 
-    // 2. App Launcher
-    private func buildLauncherPage() -> G2PageSpec {
+    // 2. Studio Minimalist Alerts Stack (`🔔 1/2` + main card + next card or `× 모두 지우기`)
+    private func buildAlertsPage() -> G2PageSpec {
+        let count = alerts.count
+        let onClearAll = (count > 0 && alertStackIdx == count)
+        let countLabel = count > 0 ? (onClearAll ? "\(count)/\(count)" : "\(alertStackIdx + 1)/\(count)") : "0"
+
         let header = G2TextContainer(
-            id: 1, name: "hdr", x: 12, y: 4, width: 552, height: 36,
-            text: "\(statusHeaderText(title: "앱 메뉴 (\(launcherPage + 1)/\(launcherPages.count))"))   [더블탭: 대시보드]",
+            id: 1, name: "ahdr", x: 24, y: 8, width: 408, height: 32,
+            text: "🔔 \(countLabel)                                     \(formattedClock())",
             captureEvents: true, padding: 4
         )
+
         var containers: [G2TextContainer] = [header]
-        let grid = launcherPages[launcherPage]
-        let colXs = [12, 200, 388]
-        let rowYs = [46, 164]
-        var cid = 2
-        for r in 0..<2 {
-            for c in 0..<3 {
-                let tile = grid[r][c]
-                let selected = (r == launcherRow && c == launcherCol)
-                let mark = selected ? "▶ " : "  "
+        if count == 0 {
+            containers.append(
+                G2TextContainer(
+                    id: 2, name: "aempty", x: 180, y: 112, width: 216, height: 56,
+                    text: "        ✓",
+                    captureEvents: false, padding: 8
+                )
+            )
+            return G2PageSpec(layoutKey: "studio_alerts_empty", textContainers: containers, imageContainers: [topStatusImage()])
+        }
+
+        let displayIdx = onClearAll ? count - 1 : min(alertStackIdx, count - 1)
+        let cur = alerts[displayIdx]
+        let cardFocused = !onClearAll
+        let curText = "\(cur.sender)   \(cur.timeLabel)\n\n\(clipVisual(cur.preview, maxUnits: 44))"
+        containers.append(
+            G2TextContainer(
+                id: 2, name: "acur", x: 28, y: 48, width: 520, height: 124,
+                text: curText,
+                captureEvents: false,
+                borderWidth: cardFocused ? 2 : 1,
+                borderColor: cardFocused ? 15 : 5,
+                borderRadius: 10,
+                padding: 12
+            )
+        )
+
+        if displayIdx + 1 < count {
+            let nxt = alerts[displayIdx + 1]
+            let nxtText = "\(nxt.sender)\n\(clipVisual(nxt.preview, maxUnits: 42))"
+            containers.append(
+                G2TextContainer(
+                    id: 3, name: "anxt", x: 28, y: 182, width: 520, height: 76,
+                    text: nxtText,
+                    captureEvents: false,
+                    borderWidth: 1,
+                    borderColor: 4,
+                    borderRadius: 10,
+                    padding: 10
+                )
+            )
+            return G2PageSpec(layoutKey: "studio_alerts_pair", textContainers: containers, imageContainers: [topStatusImage()])
+        } else {
+            containers.append(
+                G2TextContainer(
+                    id: 3, name: "aclr", x: 204, y: 196, width: 168, height: 42,
+                    text: "   × 모두 지우기",
+                    captureEvents: false,
+                    borderWidth: onClearAll ? 2 : 1,
+                    borderColor: onClearAll ? 15 : 7,
+                    borderRadius: 10,
+                    padding: 8
+                )
+            )
+            return G2PageSpec(layoutKey: onClearAll ? "studio_alerts_clr_on" : "studio_alerts_clr_off", textContainers: containers, imageContainers: [topStatusImage()])
+        }
+    }
+
+    // 3. Studio Minimalist Menu Preview (Slot #1 `피드` 2 balanced rows + 8-Slot Bottom Dock!)
+    private func buildLauncherPage() -> G2PageSpec {
+        let isFeedSlot = (menuSlotIdx == 0)
+        let onDock = (menuFocus < 0)
+        let rec = recommendedArticles()
+
+        let headerLeft: String
+        if isFeedSlot {
+            headerLeft = onDock ? "✦ 피드" : "✦ 피드  \(menuFocus + 1)/\(rec.count)"
+        } else {
+            headerLeft = "\(menuSlotIdx + 1)/8"
+        }
+
+        let header = G2TextContainer(
+            id: 1, name: "mhdr", x: 24, y: 8, width: 408, height: 32,
+            text: "\(headerLeft)                                \(formattedClock())",
+            captureEvents: true, padding: 4
+        )
+
+        var containers: [G2TextContainer] = [header]
+        var images: [G2ImageContainer] = [topStatusImage()]
+        images.append(contentsOf: G2StudioGraphics.makeMenuDockTiles(selectedIdx: menuSlotIdx, dockFocused: onDock, slotCount: 8))
+
+        if isFeedSlot && !rec.isEmpty {
+            let total = rec.count
+            let focusIdx = max(-1, min(total - 1, menuFocus))
+            let maxViewTop = max(0, total - 2)
+            let viewTop = focusIdx < 0 ? 0 : min(focusIdx, maxViewTop)
+
+            for pos in 0..<min(2, total) {
+                let idx = viewTop + pos
+                let art = rec[idx]
+                let focused = (idx == focusIdx)
+                let num = String(format: "%02d", idx + 1)
+                let title = clipVisual(art.title, maxUnits: 34)
+                let meta = "\(art.category) · \(art.timeLabel)"
+                let snip = clipVisual(art.snippet, maxUnits: 44)
+                let rowText = "\(num)  \(title)   \(meta)\n\(snip)"
                 containers.append(
                     G2TextContainer(
-                        id: cid, name: "app\(cid)", x: colXs[c], y: rowYs[r], width: 176, height: 108,
-                        text: "\(mark)\(tile.title)\n\n  \(tile.subtitle)",
+                        id: 2 + pos,
+                        name: "mrow\(pos)",
+                        x: 24,
+                        y: 44 + pos * 80,
+                        width: 528,
+                        height: 74,
+                        text: rowText,
                         captureEvents: false,
-                        borderWidth: selected ? 3 : 1,
-                        borderColor: selected ? 15 : 4,
-                        borderRadius: 8,
+                        borderWidth: focused ? 2 : 0,
+                        borderColor: focused ? 15 : 0,
+                        borderRadius: 10,
                         padding: 8
                     )
                 )
-                cid += 1
             }
+            let focusKey = focusIdx < 0 ? "dock" : "r\(focusIdx - viewTop)"
+            return G2PageSpec(layoutKey: "studio_menu_feed_\(focusKey)", textContainers: containers, imageContainers: images)
+        } else {
+            containers.append(
+                G2TextContainer(
+                    id: 2, name: "mempty", x: 188, y: 98, width: 200, height: 52,
+                    text: "        슬롯 \(menuSlotIdx + 1)",
+                    captureEvents: false, padding: 8
+                )
+            )
+            return G2PageSpec(layoutKey: "studio_menu_empty", textContainers: containers, imageContainers: images)
         }
-        return G2PageSpec(layoutKey: "launcher_p\(launcherPage)_r\(launcherRow)_c\(launcherCol)", textContainers: containers)
     }
 
-    // 3. Even AI (DGX Spark Warm `agy` Real-Time Streaming)
-    private func buildEvenAIPage() -> G2PageSpec {
+    // 4. Studio Full-Screen Feed App (Category Tabs + 3 Balanced High-Legibility Articles)
+    private func buildFeedAppPage() -> G2PageSpec {
+        let safeCatIdx = max(0, min(feedCategories.count - 1, feedCatIdx))
+        let cat = feedCategories[safeCatIdx]
+        let items = cat.articles
+        let total = items.count
+        let focus = max(0, min(max(0, total - 1), feedCatFocus))
+
+        let tabStrip = feedCategories.enumerated().map { idx, tab in
+            idx == safeCatIdx ? "[\(tab.label)]" : tab.label
+        }.joined(separator: "  ")
+        let countBadge = total > 0 ? "  \(focus + 1)/\(total)" : ""
+
         let header = G2TextContainer(
-            id: 1, name: "hdr", x: 12, y: 4, width: 552, height: 36,
-            text: "\(statusHeaderText(title: "Even AI (\(sparkNodeStatus))"))",
+            id: 1, name: "fhdr", x: 20, y: 6, width: 536, height: 34,
+            text: "\(tabStrip)\(countBadge)",
             captureEvents: true, padding: 4
         )
 
+        var containers: [G2TextContainer] = [header]
+        let isSearch = (cat.id == "search")
+        var startY = 46
+
+        if isSearch {
+            let qDisp = feedSearchQuery.isEmpty ? "전체" : feedSearchQuery
+            containers.append(
+                G2TextContainer(
+                    id: 5, name: "fsearch", x: 24, y: 42, width: 528, height: 30,
+                    text: "⌕ “\(clipVisual(qDisp, maxUnits: 28))”  ·  \(total)건",
+                    captureEvents: false, padding: 4
+                )
+            )
+            startY = 78
+        }
+
+        let visibleCount = min(isSearch ? 2 : 3, total)
+        let maxViewTop = max(0, total - visibleCount)
+        let viewTop = min(focus, maxViewTop)
+        let rowH = isSearch ? 86 : 74
+        let rowStep = isSearch ? 94 : 78
+
+        for pos in 0..<visibleCount {
+            let idx = viewTop + pos
+            let art = items[idx]
+            let focused = (idx == focus)
+            let num = String(format: "%02d", idx + 1)
+            let title = clipVisual(art.title, maxUnits: 33)
+            let meta = "\(art.outlet) · \(art.timeLabel)"
+            let snip = clipVisual(art.snippet, maxUnits: 44)
+            let rowText = "\(num)  \(title)   \(meta)\n\(snip)"
+
+            containers.append(
+                G2TextContainer(
+                    id: 2 + pos,
+                    name: "frow\(pos)",
+                    x: 24,
+                    y: startY + pos * rowStep,
+                    width: 528,
+                    height: rowH,
+                    text: rowText,
+                    captureEvents: false,
+                    borderWidth: focused ? 2 : 0,
+                    borderColor: focused ? 15 : 0,
+                    borderRadius: 10,
+                    padding: 8
+                )
+            )
+        }
+
+        let focusSlot = focus - viewTop
+        return G2PageSpec(
+            layoutKey: "studio_feed_\(isSearch ? "s" : "c")_v\(visibleCount)_f\(focusSlot)",
+            textContainers: containers
+        )
+    }
+
+    // 5. Studio Article / Alert Full Reader (Clean Header + 6-Line Body, ZERO guide clutter!)
+    private func buildReaderDetailPage() -> G2PageSpec {
+        let headerText: String
+        if readerSourceIsAlert, !alerts.isEmpty {
+            let idx = max(0, min(alerts.count - 1, alertStackIdx))
+            let a = alerts[idx]
+            headerText = "\(a.sender)                                \(a.timeLabel)"
+        } else if let art = findArticle(id: activeArticleId) {
+            headerText = "✦ \(art.category) · \(art.outlet)                    \(art.timeLabel)"
+        } else {
+            headerText = "상세 보기"
+        }
+
+        let lines = currentReaderLines()
+        let maxScroll = max(0, lines.count - 6)
+        let safeScroll = max(0, min(maxScroll, detailScroll))
+        let slice = Array(lines.dropFirst(safeScroll).prefix(6))
+
+        let header = G2TextContainer(
+            id: 1, name: "rhdr", x: 24, y: 8, width: 528, height: 34,
+            text: headerText,
+            captureEvents: true, padding: 4
+        )
+        let body = G2TextContainer(
+            id: 2, name: "rbody", x: 24, y: 48, width: 528, height: 226,
+            text: slice.joined(separator: "\n"),
+            captureEvents: false, padding: 8
+        )
+        return G2PageSpec(layoutKey: "studio_reader", textContainers: [header, body])
+    }
+
+    // 6. Minimalist Even AI Reply (DGX Spark Warm `agy`)
+    private func buildEvenAIPage() -> G2PageSpec {
+        let headerTitle: String
         let bodyLines: [String]
-        let footer: String
 
         if aiTurns.isEmpty {
-            bodyLines = [
-                "",
-                "  ● \(aiLiveStatus)",
-                "",
-                "  모션 패드를 길게 누른 채 질문하거나 명령하세요.",
-                "  예) \"타이머 5분 맞춰줘\" / \"오늘 주요 뉴스 알려줘\""
-            ]
-            footer = toastMessage ?? "홀드: 말하기 · 탭: 새 대화 · 더블탭: 뒤로"
+            headerTitle = "✦ AI"
+            bodyLines = ["", "  ● \(aiLiveStatus)"]
         } else {
             let idx = max(0, min(aiTurns.count - 1, aiTurnIndex))
             let turn = aiTurns[idx]
+            headerTitle = "✦ \(clipVisual(turn.question, maxUnits: 30))"
             let wrapped = currentAIAnswerLines()
-            let safeOff = max(0, min(aiScrollOffset, max(0, wrapped.count - 4)))
-            let slice = Array(wrapped.dropFirst(safeOff).prefix(4))
-            let qLine = "Q: \(Self.wrapForG2(turn.question, maxVisualUnits: 42).first ?? turn.question)"
-            bodyLines = [qLine, "────────────────────────────"] + slice
-            let pageInfo = wrapped.count > 4 ? "줄 \(safeOff + 1)/\(wrapped.count) · " : ""
-            footer = toastMessage ?? "\(pageInfo)대화 \(idx + 1)/\(aiTurns.count) (\(turn.meta)) · ↑↓스크롤 · 홀드 후속질문"
+            let safeOff = max(0, min(aiScrollOffset, max(0, wrapped.count - 5)))
+            bodyLines = Array(wrapped.dropFirst(safeOff).prefix(5))
         }
 
+        let header = G2TextContainer(
+            id: 1, name: "aihdr", x: 24, y: 8, width: 408, height: 34,
+            text: headerTitle,
+            captureEvents: true, padding: 4
+        )
         let body = G2TextContainer(
-            id: 2, name: "aibody", x: 12, y: 44, width: 552, height: 192,
+            id: 2, name: "aibody", x: 24, y: 50, width: 528, height: 220,
             text: bodyLines.joined(separator: "\n"),
-            captureEvents: false, borderWidth: 1, borderColor: 12, borderRadius: 8, padding: 8
+            captureEvents: false, padding: 8
         )
-        let foot = G2TextContainer(
-            id: 3, name: "aifoot", x: 12, y: 242, width: 552, height: 40,
-            text: footer,
-            captureEvents: false, padding: 4
-        )
-        return G2PageSpec(layoutKey: "screen_even_ai", textContainers: [header, body, foot])
+        return G2PageSpec(layoutKey: "studio_ai_reply", textContainers: [header, body], imageContainers: [topStatusImage()])
     }
 
     // 4. Real-Time Bilingual Translate (2-card split: Source top + Translation bottom)
@@ -1457,29 +1920,19 @@ public final class G2OSStateMachine: ObservableObject {
         return buildStandardScreenPage(layoutKey: "screen_settings", title: "기기 설정 (\(settingsIndex + 1)/\(items.count))", bodyLines: body, footer: toastMessage ?? "↑↓이동 · ←→값조절 · 탭 실행 · 더블탭 뒤로")
     }
 
-    // Global Push-to-Talk Mic Overlay (with LIVE faster-whisper partial captions!)
+    // Minimalist Push-to-Talk Listening Overlay (matching Studio pill)
     private func buildMicOverlayPage() -> G2PageSpec {
-        let sec = Double(micDurationMs) / 1000.0
-        let levelNorm = max(0, min(12, Int(abs(Int(micSignal))) / 250))
-        let bar = String(repeating: "█", count: levelNorm) + String(repeating: "░", count: 12 - levelNorm)
-        let secStr = String(format: "%.1f", sec)
-        let partialLine = aiLivePartialSTT.isEmpty
-            ? "말씀하세요... 손을 떼면 agy에게 바로 전송됩니다."
-            : "\"\(Self.wrapForG2(aiLivePartialSTT, maxVisualUnits: 44).suffix(2).joined(separator: "\n"))\""
+        let icon = voiceSearchCaptureActive ? "⌕" : "✦"
+        let liveText = aiLivePartialSTT.isEmpty
+            ? (voiceSearchCaptureActive ? "검색어를 말씀하세요..." : "듣는 중...")
+            : "“\(clipVisual(aiLivePartialSTT, maxUnits: 38))”"
 
-        let card = G2TextContainer(
-            id: 1, name: "mic", x: 16, y: 20, width: 544, height: 248,
-            text: [
-                "  ● Even AI 듣는 중 (\(sparkNodeStatus))",
-                "  ────────────────────────────────",
-                "",
-                "  \(partialLine)",
-                "",
-                "  신호 [\(bar)]   \(secStr)초 (\(micPackets) pkt)"
-            ].joined(separator: "\n"),
-            captureEvents: true, borderWidth: 3, borderColor: 15, borderRadius: 10, padding: 12
+        let pill = G2TextContainer(
+            id: 1, name: "micpill", x: 46, y: 116, width: 484, height: 56,
+            text: " \(icon)  ●  \(liveText)",
+            captureEvents: true, borderWidth: 2, borderColor: 15, borderRadius: 10, padding: 14
         )
-        return G2PageSpec(layoutKey: "overlay_mic", textContainers: [card])
+        return G2PageSpec(layoutKey: "studio_mic_pill", textContainers: [pill], imageContainers: [topStatusImage()])
     }
 
     private func buildAlertPage(_ alert: G2ActiveAlert) -> G2PageSpec {

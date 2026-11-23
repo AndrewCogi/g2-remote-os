@@ -114,30 +114,50 @@ private struct G2CanvasPreview: View {
                             .offset(x: CGFloat(img.x) * sx, y: CGFloat(img.y) * sy)
                     }
 
-                    // Render multi-container text cards with exact proportional geometry & borders
+                    // Render multi-container text cards with Studio-grade proportional SF Pro typography & focus pills
                     ForEach(page.textContainers) { tc in
-                        let borderOpacity = tc.borderWidth > 0 ? max(0.18, Double(tc.borderColor) / 16.0) : 0.0
-                        let fontSize = max(7.0, (compact ? 10.0 : 12.2) * (geo.size.width / 360.0))
+                        let isFocusedCard = tc.borderWidth >= 2
+                        let borderOpacity = tc.borderWidth > 0 ? max(0.22, Double(tc.borderColor) / 15.0) : 0.0
+                        let fontSize = max(7.5, (compact ? 10.2 : 12.6) * (geo.size.width / 360.0))
 
-                        Text(tc.text)
-                            .font(.system(size: fontSize, weight: .medium, design: .monospaced))
-                            .foregroundColor(Color(red: 0.26, green: 1.0, blue: 0.48))
-                            .lineSpacing(1.5)
-                            .padding(CGFloat(tc.padding) * sx)
-                            .frame(
-                                width: CGFloat(tc.width) * sx,
-                                height: CGFloat(tc.height) * sy,
-                                alignment: .topLeading
-                            )
-                            .clipped()
-                            .overlay(
+                        ZStack(alignment: .leading) {
+                            if isFocusedCard {
                                 RoundedRectangle(cornerRadius: CGFloat(tc.borderRadius) * sx, style: .continuous)
-                                    .stroke(
-                                        Color(red: 0.26, green: 1.0, blue: 0.48).opacity(borderOpacity),
-                                        lineWidth: max(0, CGFloat(tc.borderWidth) * sx)
-                                    )
-                            )
-                            .offset(x: CGFloat(tc.x) * sx, y: CGFloat(tc.y) * sy)
+                                    .fill(Color(red: 0.22, green: 1.0, blue: 0.45).opacity(0.11))
+                            } else if tc.borderWidth == 1 {
+                                RoundedRectangle(cornerRadius: CGFloat(tc.borderRadius) * sx, style: .continuous)
+                                    .fill(Color(red: 0.22, green: 1.0, blue: 0.45).opacity(0.05))
+                            }
+
+                            Text(tc.text)
+                                .font(.system(size: fontSize, weight: isFocusedCard ? .semibold : .medium))
+                                .foregroundColor(Color(red: 0.26, green: 1.0, blue: 0.48).opacity(isFocusedCard ? 1.0 : 0.84))
+                                .lineSpacing(2.5)
+                                .padding(.horizontal, CGFloat(tc.padding) * sx)
+                                .padding(.vertical, CGFloat(max(2, tc.padding - 2)) * sy)
+                                .frame(
+                                    width: CGFloat(tc.width) * sx,
+                                    height: CGFloat(tc.height) * sy,
+                                    alignment: .topLeading
+                                )
+                                .clipped()
+
+                            if isFocusedCard {
+                                Capsule()
+                                    .fill(Color(red: 0.30, green: 1.0, blue: 0.52))
+                                    .frame(width: max(2.2, 3.5 * sx), height: max(8, CGFloat(tc.height - 20) * sy))
+                                    .padding(.leading, 4 * sx)
+                            }
+                        }
+                        .frame(width: CGFloat(tc.width) * sx, height: CGFloat(tc.height) * sy)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: CGFloat(tc.borderRadius) * sx, style: .continuous)
+                                .stroke(
+                                    Color(red: 0.26, green: 1.0, blue: 0.48).opacity(isFocusedCard ? 0.45 : borderOpacity * 0.7),
+                                    lineWidth: max(0, CGFloat(tc.borderWidth == 1 ? 1.0 : 0.8))
+                                )
+                        )
+                        .offset(x: CGFloat(tc.x) * sx, y: CGFloat(tc.y) * sy)
                     }
                 }
             }

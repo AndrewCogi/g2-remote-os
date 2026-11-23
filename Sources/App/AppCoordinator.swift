@@ -20,6 +20,7 @@ public final class AppCoordinator: ObservableObject {
     public let calendar = CalendarQuickListService()
     public let pedometer = PedometerService()
     public let clockTools = AlarmTimerService()
+    public let feed = FeedService()
 
     @Published public private(set) var logs: [String] = []
     @Published public var keepAliveEnabled: Bool = true {
@@ -81,6 +82,7 @@ public final class AppCoordinator: ObservableObject {
         pedometer.start()
         clockTools.start()
         tailscale.start()
+        feed.refresh()
         syncTailscaleToOS(connected: tailscale.isTailscaleConnected, ip: tailscale.tailscaleIPv4, push: false)
         syncAllServicesToOS(push: false)
 
@@ -99,6 +101,7 @@ public final class AppCoordinator: ObservableObject {
         } else if !spark.isConnected {
             os.sparkNodeStatus = "Spark 연결 중"
         }
+        os.feedCategories = feed.categories
         os.refreshDisplay(pushToGlasses: push)
     }
 
@@ -121,6 +124,7 @@ public final class AppCoordinator: ObservableObject {
     public func refreshAllData() {
         weather.requestLocationAndRefresh()
         calendar.refresh()
+        feed.refresh()
         ble.querySettings()
         syncAllServicesToOS(push: true)
     }
@@ -144,6 +148,7 @@ public final class AppCoordinator: ObservableObject {
         os.isStopwatchRunning = clockTools.isStopwatchRunning
         os.stopwatchLaps = clockTools.stopwatchLaps
         os.activeAlert = clockTools.activeAlert
+        os.feedCategories = feed.categories
         os.refreshDisplay(pushToGlasses: push)
     }
 
@@ -327,9 +332,20 @@ public final class AppCoordinator: ObservableObject {
         clockTools.onAlertDismissed = { [weak self] in
             self?.syncAllServicesToOS(push: true)
         }
+        feed.onUpdated = { [weak self] cats in
+            guard let self else { return }
+            self.os.feedCategories = cats
+            let push = (self.os.currentScreen == .dashboard || self.os.currentScreen == .launcher || self.os.currentScreen == .feedApp)
+            self.os.refreshDisplay(pushToGlasses: push)
+        }
 
         // Outbound OS callbacks
         os.onPageChanged = { [weak self] page in self?.ble.renderPage(page) }
+        os.onFeedVoiceSearch = { [weak self] query in
+            guard let self else { return }
+            self.appendLog("[피드 검색] \(query)")
+            self.feed.applyVoiceSearch(query)
+        }
         os.onToggleMic = { [weak self] enabled in
             guard let self else { return }
             self.ble.setMicrophoneEnabled(enabled)
