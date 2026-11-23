@@ -6,3 +6,5 @@ DerivedData/
 .swiftpm/
 xcuserdata/
 *.ipa
+*.zip
+handoff/
