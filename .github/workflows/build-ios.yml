@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
@@ -63,7 +66,8 @@ jobs:
           test -d "$APP_PATH"
           echo "=== Verifying Info.plist background modes ==="
           /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$APP_PATH/Info.plist"
-          echo "=== Verifying embedded frameworks ==="
+          echo "=== Verifying compiled app icon & embedded frameworks ==="
+          ls -la "$APP_PATH/Assets.car" || true
           ls -la "$APP_PATH/Frameworks" || true
           mkdir -p build/Payload
           cp -R "$APP_PATH" build/Payload/
@@ -77,3 +81,26 @@ jobs:
           name: G2RemoteOS-ipa
           path: build/G2RemoteOS.ipa
           retention-days: 30
+
+      - name: Publish Latest Release (Direct IPA for iPhone GitHub App)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="latest"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          NOW_UTC="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          TITLE="G2 OS Latest (${SHORT_SHA})"
+          NOTES="자동 빌드 (${NOW_UTC}, \`${SHORT_SHA}\`). 아래 **G2RemoteOS.ipa** 를 눌러 파일 앱 저장 후 SideStore에서 바로 설치하세요."
+
+          git tag -f "$TAG" "$GITHUB_SHA"
+          git push -f origin "refs/tags/${TAG}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
+            gh release upload "$TAG" build/G2RemoteOS.ipa --clobber
+          else
+            gh release create "$TAG" build/G2RemoteOS.ipa \
+              --title "$TITLE" \
+              --notes "$NOTES" \
+              --latest
+          fi
