@@ -9,6 +9,7 @@ public final class AppCoordinator: ObservableObject {
 
     public let ble = G2BLEManager()
     public let flic = FlicDuoDriver()
+    public let gamepad = GameControllerDriver()
     public let os = G2OSStateMachine()
     public let backgroundKeeper = BackgroundKeeper()
     public let spark = SparkBridgeClient()
@@ -62,6 +63,7 @@ public final class AppCoordinator: ObservableObject {
         appendLog("[SYS] G2 OS v0.4 (DGX Spark agy) 시작")
 
         flic.configure()
+        gamepad.start()
 
         let saved: Bool
         if UserDefaults.standard.object(forKey: Self.keepAliveKey) == nil {
@@ -209,6 +211,7 @@ public final class AppCoordinator: ObservableObject {
     private func wireCallbacks() {
         ble.onLog = { [weak self] msg in self?.appendLog(msg) }
         flic.onLog = { [weak self] msg in self?.appendLog(msg) }
+        gamepad.onLog = { [weak self] msg in self?.appendLog(msg) }
         backgroundKeeper.onLog = { [weak self] msg in self?.appendLog(msg) }
         spark.onLog = { [weak self] msg in self?.appendLog(msg) }
 
@@ -246,6 +249,14 @@ public final class AppCoordinator: ObservableObject {
         flic.onAction = { [weak self] event in
             guard let self else { return }
             self.appendLog("[Flic] \(event.detail) → \(event.action.rawValue)")
+            self.os.handle(event)
+            self.updateImuStreamingNeed()
+        }
+
+        gamepad.onAction = { [weak self] event in
+            guard let self else { return }
+            self.playHaptic(for: event.action)
+            self.appendLog("[8BitDo] \(event.detail) → \(event.action.rawValue)")
             self.os.handle(event)
             self.updateImuStreamingNeed()
         }

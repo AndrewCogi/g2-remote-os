@@ -23,6 +23,7 @@ struct G2RemoteOSApp: App {
                 .environmentObject(coordinator)
                 .environmentObject(coordinator.ble)
                 .environmentObject(coordinator.flic)
+                .environmentObject(coordinator.gamepad)
                 .environmentObject(coordinator.os)
                 .environmentObject(coordinator.backgroundKeeper)
                 .environmentObject(coordinator.weather)

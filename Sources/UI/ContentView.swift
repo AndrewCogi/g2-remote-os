@@ -8,6 +8,7 @@ struct ContentView: View {
     @EnvironmentObject var coordinator: AppCoordinator
     @EnvironmentObject var ble: G2BLEManager
     @EnvironmentObject var flic: FlicDuoDriver
+    @EnvironmentObject var gamepad: GameControllerDriver
     @EnvironmentObject var os: G2OSStateMachine
     @EnvironmentObject var keeper: BackgroundKeeper
     @EnvironmentObject var calendar: CalendarQuickListService
@@ -16,6 +17,7 @@ struct ContentView: View {
     @EnvironmentObject var tailscale: TailscaleMonitor
 
     @State private var showMotionPad = false
+    @State private var showPocketMode = false
     @State private var showConnectionSheet = false
     @State private var showToolsSheet = false
     @State private var showSettingsSheet = false
@@ -46,6 +48,8 @@ struct ContentView: View {
                     alwaysOnActive: coordinator.keepAliveEnabled && keeper.isActive
                 )
 
+                pocketModeLaunchButton
+
                 motionPadLaunchCard
 
                 quickActionBar
@@ -69,10 +73,18 @@ struct ContentView: View {
                 .environmentObject(coordinator)
                 .environmentObject(ble)
                 .environmentObject(flic)
+                .environmentObject(gamepad)
                 .environmentObject(os)
                 .environmentObject(keeper)
                 .environmentObject(spark)
                 .environmentObject(tailscale)
+        }
+        .fullScreenCover(isPresented: $showPocketMode) {
+            PocketModeView()
+                .environmentObject(coordinator)
+                .environmentObject(ble)
+                .environmentObject(gamepad)
+                .environmentObject(os)
         }
         .sheet(isPresented: $showConnectionSheet) {
             NavigationStack {
@@ -81,6 +93,7 @@ struct ContentView: View {
             .environmentObject(coordinator)
             .environmentObject(ble)
             .environmentObject(flic)
+            .environmentObject(gamepad)
             .preferredColorScheme(.dark)
         }
         .sheet(isPresented: $showToolsSheet) {
@@ -221,7 +234,60 @@ struct ContentView: View {
         return ble.phase == .disconnected ? "G2 연결하기" : ble.phase.rawValue
     }
 
-    // MARK: - Primary Hero Card: Fullscreen Motion Pad
+    // MARK: - Primary Hero Cards: Pocket Mode (8BitDo Zero 2) + Fullscreen Motion Pad
+
+    private var pocketModeLaunchButton: some View {
+        Button {
+            showPocketMode = true
+        } label: {
+            HStack(spacing: 12) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill((gamepad.isConnected ? Color.green : Color.blue).opacity(0.18))
+                        .frame(width: 42, height: 42)
+                    Image(systemName: "gamecontroller.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(gamepad.isConnected ? .green : .cyan)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("주머니 포켓 모드")
+                            .font(.headline)
+                            .foregroundColor(.white)
+                        Text(gamepad.isConnected ? "Micro 연결됨" : "8BitDo Micro")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundColor(gamepad.isConnected ? .black : .cyan)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(gamepad.isConnected ? Color.green : Color.cyan.opacity(0.18))
+                            .clipShape(Capsule())
+                    }
+                    Text("주머니에 넣으면 근접 센서로 화면·터치 자동 OFF")
+                        .font(.caption)
+                        .foregroundColor(.white.opacity(0.55))
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(.white.opacity(0.4))
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 13)
+            .background(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color.white.opacity(0.055))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke((gamepad.isConnected ? Color.green : Color.cyan).opacity(0.32), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
 
     private var motionPadLaunchCard: some View {
         Button {

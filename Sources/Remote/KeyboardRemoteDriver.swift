@@ -1,9 +1,8 @@
+import GameController
 import SwiftUI
 import UIKit
 
-/// Bonus foreground/OLED-pocket-mode driver for Bluetooth HID keyboards (e.g., 8BitDo Micro in K-mode).
-/// Note: iOS blocks HID keyboard input when the device is hardware-locked, so this only operates
-/// while the app is in the foreground (including OLED black pocket mode).
+/// Minimal fallback UIKeyCommand capture (yields to `GameControllerDriver`'s `GCKeyboard` when active).
 public struct KeyboardCaptureView: UIViewControllerRepresentable {
     public let onAction: (RemoteCommandEvent) -> Void
 
@@ -41,13 +40,7 @@ public final class KeyCaptureController: UIViewController {
             ("\r", #selector(handleSelect), "Enter"),
             (" ", #selector(handleSelect), "Space"),
             (UIKeyCommand.inputEscape, #selector(handleBack), "Esc"),
-            ("\u{8}", #selector(handleBack), "Backspace"),
-            ("m", #selector(handleMic), "Mic"),
-            ("h", #selector(handleHome), "Home"),
-            ("w", #selector(handleScrollUp), "ScrollUp"),
-            ("s", #selector(handleScrollDown), "ScrollDown"),
-            ("[", #selector(handleBrightnessDown), "BrightDown"),
-            ("]", #selector(handleBrightnessUp), "BrightUp")
+            ("\u{8}", #selector(handleBack), "Backspace")
         ]
         return bindings.map { input, action, title in
             let cmd = UIKeyCommand(input: input, modifierFlags: [], action: action)
@@ -58,6 +51,7 @@ public final class KeyCaptureController: UIViewController {
     }
 
     private func fire(_ action: RemoteAction, key: String) {
+        if GCKeyboard.coalesced != nil { return }
         onAction?(RemoteCommandEvent(action: action, source: .keyboard, detail: "Key(\(key))"))
     }
 
@@ -67,10 +61,4 @@ public final class KeyCaptureController: UIViewController {
     @objc private func handleRight() { fire(.right, key: "→") }
     @objc private func handleSelect() { fire(.select, key: "Enter") }
     @objc private func handleBack() { fire(.back, key: "Esc") }
-    @objc private func handleMic() { fire(.micToggle, key: "M") }
-    @objc private func handleHome() { fire(.home, key: "H") }
-    @objc private func handleScrollUp() { fire(.scrollUp, key: "W") }
-    @objc private func handleScrollDown() { fire(.scrollDown, key: "S") }
-    @objc private func handleBrightnessUp() { fire(.brightnessUp, key: "]") }
-    @objc private func handleBrightnessDown() { fire(.brightnessDown, key: "[") }
 }

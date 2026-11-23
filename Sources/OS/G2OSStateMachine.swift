@@ -574,12 +574,12 @@ public final class G2OSStateMachine: ObservableObject {
             rebuildDisplay()
             return
         case .screenToggle:
+            // Instant 0.1s stealth screen blackout/wake (works even with Always-On OS active!)
             if alwaysOnEnabled {
-                if headUpWakeEnabled {
-                    if isHeadUpDimmed { wakeFromHeadUpStandby() } else { enterHeadUpStandby() }
+                if isHeadUpDimmed {
+                    wakeFromHeadUpStandby()
                 } else {
-                    showToast("항시 OS 유지 활성화됨")
-                    rebuildDisplay()
+                    enterHeadUpStandby()
                 }
             } else {
                 isScreenAsleep.toggle()

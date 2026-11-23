@@ -4,6 +4,7 @@ struct ConnectionView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var ble: G2BLEManager
     @EnvironmentObject var flic: FlicDuoDriver
+    @EnvironmentObject var gamepad: GameControllerDriver
 
     var body: some View {
         List {
@@ -73,6 +74,37 @@ struct ConnectionView: View {
                         }
                     }
                 }
+            }
+
+            Section {
+                HStack {
+                    Text("상태")
+                    Spacer()
+                    Text(gamepad.isConnected ? "\(gamepad.controllerName) (\(gamepad.connectionModeLabel))" : "연결 대기 중")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(gamepad.isConnected ? .green : .secondary)
+                }
+                HStack {
+                    Text("최근 입력 버튼")
+                    Spacer()
+                    Text(gamepad.lastButtonLabel)
+                        .font(.caption.monospaced())
+                        .foregroundColor(gamepad.isConnected ? .green : .secondary)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("왼손 세로 (90° ↻) 키 매핑")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.primary)
+                    Text("• 십자키 (엄지): 90° 시계 자동 보정 상하좌우 이동\n• 짧은 L2 (검지): 1클릭 열기 · 꾹 누르기 AI\n• 짧은 R2 (중지): 1클릭 뒤로가기 (닫기)\n• 그 외 모든 버튼 (L1/R1 · ABXY · -/+): 비활성")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.vertical, 2)
+            } header: {
+                Text("8BitDo Micro 컨트롤러")
+            } footer: {
+                Text("페어링 방법: Micro 하단 스위치를 S(Switch 모드)로 두고 홈 버튼을 켠 뒤 페어링 버튼을 3초 눌러 iPhone 설정 > 블루투스에서 연결하세요.")
             }
 
             Section {
