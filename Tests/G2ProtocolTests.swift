@@ -109,47 +109,60 @@ final class G2ProtocolTests: XCTestCase {
         let os = G2OSStateMachine()
         var micEvents: [Bool] = []
         var sleepCalled = false
-        var brightnessSet: Int?
-        var heightSet: Int?
         os.onToggleMic = { micEvents.append($0) }
         os.onSetScreenAsleep = { if $0 { sleepCalled = true } }
-        os.onSetBrightness = { brightnessSet = $0 }
-        os.onSetDisplayHeight = { heightSet = $0 }
 
-        // 1. Starts on stock-style Dashboard with multi-container + 4-bit pixel clock
+        // 1. Starts on Studio Minimalist Home (centered clock + top Tailscale/battery + bottom peek pill)
         XCTAssertEqual(os.currentScreen, .dashboard)
-        XCTAssertEqual(os.currentPage.textContainers.count, 3)
-        XCTAssertEqual(os.currentPage.imageContainers.count, 1)
+        XCTAssertEqual(os.currentPage.textContainers.count, 1)
+        XCTAssertEqual(os.currentPage.imageContainers.count, 2)
         XCTAssertEqual(os.currentPage.textContainers.filter(\.captureEvents).count, 1)
 
-        // 2. Back on Dashboard NEVER sleeps or exits to stock OS
-        os.handle(RemoteCommandEvent(action: .back, source: .motionPad))
+        // 2. Back on Home NEVER sleeps or exits to stock OS
+        os.handle(RemoteCommandEvent(action: .back, source: .zero2))
         XCTAssertEqual(os.currentScreen, .dashboard)
         XCTAssertFalse(sleepCalled)
 
-        // 3. Swipe right cycles Dashboard widgets, tap opens 3x2 bordered App Launcher
-        os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
-        XCTAssertEqual(os.dashboardTab, 1)
-        os.handle(RemoteCommandEvent(action: .select, source: .motionPad))
+        // 3. Home ↓ opens Alerts Stack; ← dismisses 1 alert; ↑ at top returns to Home
+        let initialAlerts = os.alerts.count
+        XCTAssertGreaterThan(initialAlerts, 0)
+        os.handle(RemoteCommandEvent(action: .down, source: .zero2))
+        XCTAssertEqual(os.currentScreen, .alerts)
+        os.handle(RemoteCommandEvent(action: .left, source: .zero2))
+        XCTAssertEqual(os.alerts.count, initialAlerts - 1)
+        os.handle(RemoteCommandEvent(action: .up, source: .zero2))
+        XCTAssertEqual(os.currentScreen, .dashboard)
+
+        // 4. Home → opens 8-slot Menu Preview (Dock focused = -1); ↑ enters/exits Quick Preview (↓ stays on Dock)
+        os.handle(RemoteCommandEvent(action: .right, source: .zero2))
         XCTAssertEqual(os.currentScreen, .launcher)
-        XCTAssertEqual(os.currentPage.textContainers.count, 7) // header + 6 bordered app cards
-        XCTAssertEqual(os.currentPage.textContainers.filter(\.captureEvents).count, 1)
+        XCTAssertEqual(os.menuFocus, -1)
+        XCTAssertEqual(os.currentPage.textContainers.count, 3)  // header + 2 balanced preview rows
+        XCTAssertEqual(os.currentPage.imageContainers.count, 3) // top status + 2 bottom dock tiles
+        os.handle(RemoteCommandEvent(action: .down, source: .zero2))
+        XCTAssertEqual(os.menuFocus, -1) // ↓ must NOT enter quick preview from dock
+        os.handle(RemoteCommandEvent(action: .up, source: .zero2))
+        XCTAssertEqual(os.menuFocus, 0)  // ↑ enters quick preview article #1
+        os.handle(RemoteCommandEvent(action: .down, source: .zero2))
+        XCTAssertEqual(os.menuFocus, 1)  // ↓ moves to article #2
+        os.handle(RemoteCommandEvent(action: .up, source: .zero2))
+        XCTAssertEqual(os.menuFocus, 0)
+        os.handle(RemoteCommandEvent(action: .up, source: .zero2))
+        XCTAssertEqual(os.menuFocus, -1) // ↑ at article #1 exits back to dock
 
-        // 4. Navigate to Hardware Settings on Launcher Page 2 (row 0, col 1 after wrapping right past col 2)
-        os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
-        os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
-        os.handle(RemoteCommandEvent(action: .right, source: .motionPad)) // Page 1, col 0 (HeadUp)
-        os.handle(RemoteCommandEvent(action: .right, source: .motionPad)) // Page 1, col 1 (Settings)
-        os.handle(RemoteCommandEvent(action: .select, source: .motionPad))
-        XCTAssertEqual(os.currentScreen, .settings)
-        os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
-        XCTAssertEqual(brightnessSet, 30)
-        os.handle(RemoteCommandEvent(action: .down, source: .motionPad))
-        os.handle(RemoteCommandEvent(action: .down, source: .motionPad))
-        os.handle(RemoteCommandEvent(action: .right, source: .motionPad))
-        XCTAssertEqual(heightSet, 12)
+        // 5. L2 on Dock opens Full-Screen Feed; → switches category; L2 opens Reader; R2 returns
+        os.handle(RemoteCommandEvent(action: .select, source: .zero2))
+        XCTAssertEqual(os.currentScreen, .feedApp)
+        os.handle(RemoteCommandEvent(action: .right, source: .zero2))
+        XCTAssertEqual(os.feedCatIdx, 1)
+        os.handle(RemoteCommandEvent(action: .select, source: .zero2))
+        XCTAssertEqual(os.currentScreen, .readerDetail)
+        os.handle(RemoteCommandEvent(action: .back, source: .zero2))
+        XCTAssertEqual(os.currentScreen, .feedApp)
+        os.handle(RemoteCommandEvent(action: .back, source: .zero2))
+        XCTAssertEqual(os.currentScreen, .launcher)
 
-        // 5. Head-Up transparent standby wakes via IMU tilt
+        // 6. Head-Up transparent standby wakes via IMU tilt
         os.setHeadUpWakeMode(true)
         os.handleImuSample(G2ImuSample(x: 0, y: 0, z: 1))
         os.calibrateHeadUpNeutral()
@@ -161,20 +174,20 @@ final class G2ProtocolTests: XCTestCase {
         XCTAssertFalse(os.isHeadUpDimmed)
         XCTAssertEqual(os.currentScreen, .dashboard)
 
-        // 6. Tailscale & Spark node badge displays on glasses
+        // 7. Tailscale & Spark connected state reflects in 9-dot graphic image hash
         os.tailscaleConnected = true
         os.handleSparkEvent(.connected(host: "spark01", latencyMs: 18, sttModel: "large-v3-turbo"))
-        XCTAssertTrue(os.renderedFrameText.contains("TS●64"))
+        XCTAssertTrue(os.currentPage.imageContainers.contains { $0.contentHash.hasPrefix("tsbat_1_1_") })
 
-        // 7. Global Push-to-Talk -> Even AI streaming flow
-        os.handle(RemoteCommandEvent(action: .micStart, source: .motionPad))
-        os.handle(RemoteCommandEvent(action: .micStart, source: .motionPad))
+        // 8. Global Push-to-Talk -> Even AI streaming flow
+        os.handle(RemoteCommandEvent(action: .micStart, source: .zero2))
+        os.handle(RemoteCommandEvent(action: .micStart, source: .zero2))
         XCTAssertTrue(os.isMicOn)
         os.handleSparkEvent(.sttPartial(mode: .evenAI, text: "내일 서울 날씨", elapsedMs: 90))
         XCTAssertTrue(os.renderedFrameText.contains("내일 서울 날씨"))
 
-        os.handle(RemoteCommandEvent(action: .micStop, source: .motionPad))
-        os.handle(RemoteCommandEvent(action: .micStop, source: .motionPad))
+        os.handle(RemoteCommandEvent(action: .micStop, source: .zero2))
+        os.handle(RemoteCommandEvent(action: .micStop, source: .zero2))
         XCTAssertFalse(os.isMicOn)
         XCTAssertEqual(micEvents, [true, false])
 
