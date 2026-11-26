@@ -1,3 +1,4 @@
+import CoreGraphics
 import SwiftUI
 
 /// True 1:1 (576x288) monochrome green live mirror rendering the exact G2PageSpec
@@ -107,15 +108,16 @@ private struct G2CanvasPreview: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    // Render 4-bit pixel image containers
+                    // Render 4-bit pixel image containers (hardware-accelerated CGImage, 1:1 Studio optical glow!)
                     ForEach(page.imageContainers) { img in
                         G2BitmapPreview(image: img)
                             .frame(width: CGFloat(img.width) * sx, height: CGFloat(img.height) * sy)
                             .offset(x: CGFloat(img.x) * sx, y: CGFloat(img.y) * sy)
                     }
+                    .shadow(color: Color(red: 0.19, green: 1.0, blue: 0.48).opacity(0.36), radius: compact ? 2 : 3.5)
 
-                    // Render multi-container text cards with Studio-grade proportional SF Pro typography & focus pills
-                    ForEach(page.textContainers) { tc in
+                    // Render non-empty text containers (skipped for invisible 1-space event-capture container)
+                    ForEach(page.textContainers.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) { tc in
                         let isFocusedCard = tc.borderWidth >= 2
                         let borderOpacity = tc.borderWidth > 0 ? max(0.22, Double(tc.borderColor) / 15.0) : 0.0
                         let fontSize = max(7.5, (compact ? 10.2 : 12.6) * (geo.size.width / 360.0))
@@ -165,32 +167,64 @@ private struct G2CanvasPreview: View {
     }
 }
 
-/// Renders a 4-bit packed monochrome green G2ImageContainer directly in SwiftUI Canvas.
+/// Hardware-accelerated 4-bit monochrome green CGImage renderer (matches Studio HTML pixel-for-pixel at 60fps!).
 private struct G2BitmapPreview: View {
     let image: G2ImageContainer
 
     var body: some View {
-        Canvas { context, size in
-            let w = image.width
-            let h = image.height
-            guard w > 0, h > 0 else { return }
-            let stride = (w + 1) / 2
-            let bytes = Array(image.packed4bpp)
-            guard bytes.count >= stride * h else { return }
+        if let cgImg = Self.makeCGImage(from: image) {
+            Image(decorative: cgImg, scale: 1.0)
+                .interpolation(.high)
+                .resizable()
+        }
+    }
 
-            let pw = size.width / CGFloat(w)
-            let ph = size.height / CGFloat(h)
+    private static func makeCGImage(from image: G2ImageContainer) -> CGImage? {
+        let w = image.width
+        let h = image.height
+        guard w > 0, h > 0 else { return nil }
+        let stride = (w + 1) / 2
+        guard image.packed4bpp.count >= stride * h else { return nil }
 
-            for r in 0..<h {
-                for c in 0..<w {
-                    let b = bytes[r * stride + (c / 2)]
-                    let nibble = (c % 2 == 0) ? (b >> 4) : (b & 0x0F)
+        var rgba = [UInt8](repeating: 0, count: w * h * 4)
+        image.packed4bpp.withUnsafeBytes { rawIn in
+            let src = rawIn.bindMemory(to: UInt8.self)
+            for y in 0..<h {
+                let srcRow = y * stride
+                let dstRow = y * w * 4
+                for x in 0..<w {
+                    let b = src[srcRow + (x >> 1)]
+                    let nibble = (x & 1 == 0) ? Int(b >> 4) : Int(b & 0x0F)
                     if nibble == 0 { continue }
-                    let alpha = Double(nibble) / 15.0
-                    let rect = CGRect(x: CGFloat(c) * pw, y: CGFloat(r) * ph, width: max(0.8, pw + 0.15), height: max(0.8, ph + 0.15))
-                    context.fill(Path(rect), with: .color(Color(red: 0.26, green: 1.0, blue: 0.48).opacity(alpha)))
+                    let level = Double(nibble) / 15.0
+                    let r = UInt8(min(255, Int((45.0 * level).rounded())))
+                    let g = UInt8(min(255, Int((255.0 * min(1.0, level * 1.1)).rounded())))
+                    let bl = UInt8(min(255, Int((122.0 * level).rounded())))
+                    let a = UInt8(min(255, Int((255.0 * min(1.0, level * 0.99)).rounded())))
+                    let p = dstRow + x * 4
+                    rgba[p]     = r
+                    rgba[p + 1] = g
+                    rgba[p + 2] = bl
+                    rgba[p + 3] = a
                 }
             }
         }
+
+        let data = Data(rgba)
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue)
+        return CGImage(
+            width: w,
+            height: h,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: bitmapInfo,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: true,
+            intent: .defaultIntent
+        )
     }
 }

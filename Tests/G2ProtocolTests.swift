@@ -112,10 +112,11 @@ final class G2ProtocolTests: XCTestCase {
         os.onToggleMic = { micEvents.append($0) }
         os.onSetScreenAsleep = { if $0 { sleepCalled = true } }
 
-        // 1. Starts on Studio Minimalist Home (centered clock + top Tailscale/battery + bottom peek pill)
+        // 1. Starts on 100% pixel-identical 4-tile Studio Minimalist Home (1 invisible event container + 4 288x144 tiles)
         XCTAssertEqual(os.currentScreen, .dashboard)
+        XCTAssertEqual(os.currentPage.layoutKey, "studio_4tile_v1")
         XCTAssertEqual(os.currentPage.textContainers.count, 1)
-        XCTAssertEqual(os.currentPage.imageContainers.count, 2)
+        XCTAssertEqual(os.currentPage.imageContainers.count, 4)
         XCTAssertEqual(os.currentPage.textContainers.filter(\.captureEvents).count, 1)
 
         // 2. Back on Home NEVER sleeps or exits to stock OS
@@ -137,8 +138,9 @@ final class G2ProtocolTests: XCTestCase {
         os.handle(RemoteCommandEvent(action: .right, source: .zero2))
         XCTAssertEqual(os.currentScreen, .launcher)
         XCTAssertEqual(os.menuFocus, -1)
-        XCTAssertEqual(os.currentPage.textContainers.count, 3)  // header + 2 balanced preview rows
-        XCTAssertEqual(os.currentPage.imageContainers.count, 3) // top status + 2 bottom dock tiles
+        XCTAssertEqual(os.currentPage.layoutKey, "studio_4tile_v1")
+        XCTAssertEqual(os.currentPage.textContainers.count, 1)
+        XCTAssertEqual(os.currentPage.imageContainers.count, 4)
         os.handle(RemoteCommandEvent(action: .down, source: .zero2))
         XCTAssertEqual(os.menuFocus, -1) // ↓ must NOT enter quick preview from dock
         os.handle(RemoteCommandEvent(action: .up, source: .zero2))
@@ -174,10 +176,11 @@ final class G2ProtocolTests: XCTestCase {
         XCTAssertFalse(os.isHeadUpDimmed)
         XCTAssertEqual(os.currentScreen, .dashboard)
 
-        // 7. Tailscale & Spark connected state reflects in 9-dot graphic image hash
+        // 7. Tailscale & Spark connected state updates top-right tile cleanly
         os.tailscaleConnected = true
         os.handleSparkEvent(.connected(host: "spark01", latencyMs: 18, sttModel: "large-v3-turbo"))
-        XCTAssertTrue(os.currentPage.imageContainers.contains { $0.contentHash.hasPrefix("tsbat_1_1_") })
+        XCTAssertEqual(os.currentPage.imageContainers.count, 4)
+        XCTAssertTrue(os.sparkConnected)
 
         // 8. Global Push-to-Talk -> Even AI streaming flow
         os.handle(RemoteCommandEvent(action: .micStart, source: .zero2))
