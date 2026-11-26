@@ -15,6 +15,12 @@ public enum G2StudioGraphics {
     public static let tileW = 288
     public static let tileH = 144
 
+    #if canImport(UIKit)
+    private typealias DrawCtx = CGContext
+    #else
+    private typealias DrawCtx = Void
+    #endif
+
     public struct RenderContext {
         public let timeStr: String
         public let dateStr: String
@@ -162,9 +168,12 @@ public enum G2StudioGraphics {
         stackIdx: Int
     ) -> G2PageSpec {
         let count = alerts.count
-        let summary = count == 0
+        let baseSummary = count == 0
             ? "알림 0건"
             : "\(alerts[min(stackIdx, count - 1)].sender): \(alerts[min(stackIdx, count - 1)].preview)"
+        let summary = rc.aiListening
+            ? "\(baseSummary)\n\(rc.livePartialSTT.isEmpty ? "듣는 중..." : rc.livePartialSTT)"
+            : baseSummary
 
         return buildFourTilePage(summary: summary) { ctx in
             #if canImport(UIKit)
@@ -223,9 +232,12 @@ public enum G2StudioGraphics {
         recArticles: [G2FeedArticle]
     ) -> G2PageSpec {
         let isFeed = (slotIdx == 0)
-        let summary = isFeed
+        let baseSummary = isFeed
             ? "피드 (\(menuFocus < 0 ? "독" : "\(menuFocus + 1)/\(recArticles.count)"))"
             : "슬롯 \(slotIdx + 1)/8"
+        let summary = rc.aiListening
+            ? "\(baseSummary)\n\(rc.livePartialSTT.isEmpty ? "듣는 중..." : rc.livePartialSTT)"
+            : baseSummary
 
         return buildFourTilePage(summary: summary) { ctx in
             #if canImport(UIKit)
@@ -327,7 +339,10 @@ public enum G2StudioGraphics {
         let items = cat.articles
         let total = items.count
         let focus = max(0, min(max(0, total - 1), catFocus))
-        let summary = "\(cat.label) \(total > 0 ? "\(focus + 1)/\(total)" : "0")"
+        let baseSummary = "\(cat.label) \(total > 0 ? "\(focus + 1)/\(total)" : "0")"
+        let summary = rc.aiListening
+            ? "\(baseSummary)\n\(rc.livePartialSTT.isEmpty ? "듣는 중..." : rc.livePartialSTT)"
+            : baseSummary
 
         return buildFourTilePage(summary: summary) { ctx in
             #if canImport(UIKit)
@@ -400,7 +415,10 @@ public enum G2StudioGraphics {
         scrollOffset: Int,
         isNewsTitleOnLine0: Bool
     ) -> G2PageSpec {
-        let summary = "\(headerLeft)\n\(lines.prefix(2).joined(separator: " "))"
+        let baseSummary = "\(headerLeft)\n\(lines.prefix(2).joined(separator: " "))"
+        let summary = rc.aiListening
+            ? "\(baseSummary)\n\(rc.livePartialSTT.isEmpty ? "듣는 중..." : rc.livePartialSTT)"
+            : baseSummary
         return buildFourTilePage(summary: summary) { ctx in
             #if canImport(UIKit)
             let detailLines = 6
@@ -462,7 +480,10 @@ public enum G2StudioGraphics {
         answerLines: [String],
         scrollOffset: Int
     ) -> G2PageSpec {
-        let summary = "\(question)\n\(answerLines.joined(separator: "\n"))"
+        let baseSummary = "\(question)\n\(answerLines.joined(separator: "\n"))"
+        let summary = rc.aiListening
+            ? "\(baseSummary)\n\(rc.livePartialSTT.isEmpty ? "듣는 중..." : rc.livePartialSTT)"
+            : baseSummary
         return buildFourTilePage(summary: summary) { ctx in
             #if canImport(UIKit)
             drawAgyIcon(ctx, cx: 30, cy: 22, size: 16, level: 15)
@@ -500,7 +521,7 @@ public enum G2StudioGraphics {
 
     private static func buildFourTilePage(
         summary: String,
-        draw: (Any) -> Void
+        draw: (DrawCtx) -> Void
     ) -> G2PageSpec {
         #if canImport(UIKit)
         var gray = [UInt8](repeating: 0, count: canvasW * canvasH)
@@ -621,7 +642,7 @@ public enum G2StudioGraphics {
     }
 
     private static func drawText(
-        _ rawCtx: Any,
+        _ ctx: CGContext,
         _ text: String,
         x: CGFloat,
         y: CGFloat,
@@ -650,8 +671,7 @@ public enum G2StudioGraphics {
         ns.draw(at: CGPoint(x: drawX, y: drawY))
     }
 
-    private static func fillRoundedRect(_ rawCtx: Any, x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, r: CGFloat, level: Int) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func fillRoundedRect(_ ctx: CGContext, x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, r: CGFloat, level: Int) {
         ctx.saveGState()
         let path = UIBezierPath(roundedRect: CGRect(x: x, y: y, width: w, height: h), cornerRadius: r)
         ctx.setFillColor(gray: gVal(level), alpha: 1.0)
@@ -660,8 +680,7 @@ public enum G2StudioGraphics {
         ctx.restoreGState()
     }
 
-    private static func fillStrokeRoundedRect(_ rawCtx: Any, x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, r: CGFloat, fillLevel: Int, strokeLevel: Int, lineWidth: CGFloat) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func fillStrokeRoundedRect(_ ctx: CGContext, x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, r: CGFloat, fillLevel: Int, strokeLevel: Int, lineWidth: CGFloat) {
         ctx.saveGState()
         let path = UIBezierPath(roundedRect: CGRect(x: x, y: y, width: w, height: h), cornerRadius: r)
         ctx.setFillColor(gray: gVal(fillLevel), alpha: 1.0)
@@ -674,8 +693,7 @@ public enum G2StudioGraphics {
         ctx.restoreGState()
     }
 
-    private static func strokeDashedRoundedRect(_ rawCtx: Any, x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, r: CGFloat, level: Int, lineWidth: CGFloat) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func strokeDashedRoundedRect(_ ctx: CGContext, x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, r: CGFloat, level: Int, lineWidth: CGFloat) {
         ctx.saveGState()
         let path = UIBezierPath(roundedRect: CGRect(x: x, y: y, width: w, height: h), cornerRadius: r)
         ctx.setLineDash(phase: 0, lengths: [2.5, 2.5])
@@ -686,8 +704,7 @@ public enum G2StudioGraphics {
         ctx.restoreGState()
     }
 
-    private static func strokeLine(_ rawCtx: Any, x0: CGFloat, y0: CGFloat, x1: CGFloat, y1: CGFloat, level: Int, lineWidth: CGFloat) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func strokeLine(_ ctx: CGContext, x0: CGFloat, y0: CGFloat, x1: CGFloat, y1: CGFloat, level: Int, lineWidth: CGFloat) {
         ctx.saveGState()
         ctx.setStrokeColor(gray: gVal(level), alpha: 1.0)
         ctx.setLineWidth(lineWidth)
@@ -697,8 +714,8 @@ public enum G2StudioGraphics {
         ctx.restoreGState()
     }
 
-    private static func strokePolyline(_ rawCtx: Any, points: [CGPoint], level: Int, lineWidth: CGFloat) {
-        guard let ctx = rawCtx as? CGContext, points.count >= 2 else { return }
+    private static func strokePolyline(_ ctx: CGContext, points: [CGPoint], level: Int, lineWidth: CGFloat) {
+        guard points.count >= 2 else { return }
         ctx.saveGState()
         ctx.setStrokeColor(gray: gVal(level), alpha: 1.0)
         ctx.setLineWidth(lineWidth)
@@ -710,16 +727,14 @@ public enum G2StudioGraphics {
         ctx.restoreGState()
     }
 
-    private static func fillCircle(_ rawCtx: Any, cx: CGFloat, cy: CGFloat, r: CGFloat, level: Int) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func fillCircle(_ ctx: CGContext, cx: CGFloat, cy: CGFloat, r: CGFloat, level: Int) {
         ctx.saveGState()
         ctx.setFillColor(gray: gVal(level), alpha: 1.0)
         ctx.fillEllipse(in: CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
         ctx.restoreGState()
     }
 
-    private static func strokeCircle(_ rawCtx: Any, cx: CGFloat, cy: CGFloat, r: CGFloat, level: Int, lineWidth: CGFloat) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func strokeCircle(_ ctx: CGContext, cx: CGFloat, cy: CGFloat, r: CGFloat, level: Int, lineWidth: CGFloat) {
         ctx.saveGState()
         ctx.setStrokeColor(gray: gVal(level), alpha: 1.0)
         ctx.setLineWidth(lineWidth)
@@ -730,7 +745,7 @@ public enum G2StudioGraphics {
     // MARK: - Studio Balanced Feed Row (Exact 1:1 Match!)
 
     private static func drawBalancedFeedRow(
-        _ ctx: Any,
+        _ ctx: CGContext,
         article: G2FeedArticle,
         numIndex: Int,
         y: CGFloat,
@@ -772,20 +787,19 @@ public enum G2StudioGraphics {
 
     // MARK: - Top Listening Pill & Studio Vector Icons
 
-    private static func drawTopListeningPill(_ rawCtx: Any, rc: RenderContext) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func drawTopListeningPill(_ ctx: CGContext, rc: RenderContext) {
         ctx.saveGState()
         ctx.setFillColor(gray: 0, alpha: 1.0)
         ctx.fill(CGRect(x: 174, y: 3, width: 398, height: 36))
         ctx.restoreGState()
 
-        fillStrokeRoundedRect(rawCtx, x: 180, y: 5, w: 376, h: 32, r: 16, fillLevel: 3, strokeLevel: 15, lineWidth: 1.4)
+        fillStrokeRoundedRect(ctx, x: 180, y: 5, w: 376, h: 32, r: 16, fillLevel: 3, strokeLevel: 15, lineWidth: 1.4)
         if rc.voiceSearchMode {
-            drawCompassIcon(rawCtx, cx: 202, cy: 21, size: 14, level: 15)
+            drawCompassIcon(ctx, cx: 202, cy: 21, size: 14, level: 15)
         } else {
-            drawAgyIcon(rawCtx, cx: 202, cy: 21, size: 14, level: 15)
+            drawAgyIcon(ctx, cx: 202, cy: 21, size: 14, level: 15)
         }
-        drawMiniBars(rawCtx, x: 218, cy: 21, count: 4, maxH: 13)
+        drawMiniBars(ctx, x: 218, cy: 21, count: 4, maxH: 13)
         let liveTxt: String
         if !rc.livePartialSTT.isEmpty {
             liveTxt = rc.voiceSearchMode ? "⌕ “\(rc.livePartialSTT)”" : "“\(rc.livePartialSTT)”"
@@ -793,18 +807,18 @@ public enum G2StudioGraphics {
             liveTxt = rc.voiceSearchMode ? "⌕ 검색어 듣는 중..." : "듣는 중..."
         }
         let font = UIFont.systemFont(ofSize: 13.5, weight: .regular)
-        drawText(rawCtx, clip(liveTxt, font: font, maxW: 296), x: 248, y: 21.5, font: font, level: 15, align: .left, baseline: .middle)
+        drawText(ctx, clip(liveTxt, font: font, maxW: 296), x: 248, y: 21.5, font: font, level: 15, align: .left, baseline: .middle)
     }
 
-    private static func drawMiniBars(_ rawCtx: Any, x: CGFloat, cy: CGFloat, count: Int, maxH: CGFloat) {
+    private static func drawMiniBars(_ ctx: CGContext, x: CGFloat, cy: CGFloat, count: Int, maxH: CGFloat) {
         let heights: [CGFloat] = [0.45, 0.92, 0.65, 1.0, 0.55]
         for i in 0..<count {
             let h = max(4, maxH * heights[i % heights.count])
-            fillRoundedRect(rawCtx, x: x + CGFloat(i) * 5.2, y: cy - h / 2.0, w: 2.8, h: h, r: 1.4, level: 14)
+            fillRoundedRect(ctx, x: x + CGFloat(i) * 5.2, y: cy - h / 2.0, w: 2.8, h: h, r: 1.4, level: 14)
         }
     }
 
-    private static func drawTailscale(_ rawCtx: Any, cx: CGFloat, cy: CGFloat, on: Bool, spark: Bool) {
+    private static func drawTailscale(_ ctx: CGContext, cx: CGFloat, cy: CGFloat, on: Bool, spark: Bool) {
         let gap: CGFloat = 5.4
         for r in -1...1 {
             for col in -1...1 {
@@ -815,13 +829,12 @@ public enum G2StudioGraphics {
                 } else {
                     level = isT ? 5 : 2
                 }
-                fillCircle(rawCtx, cx: cx + CGFloat(col) * gap, cy: cy + CGFloat(r) * gap, r: isT ? 1.85 : 1.45, level: level)
+                fillCircle(ctx, cx: cx + CGFloat(col) * gap, cy: cy + CGFloat(r) * gap, r: isT ? 1.85 : 1.45, level: level)
             }
         }
     }
 
-    private static func drawBattery(_ rawCtx: Any, x: CGFloat, y: CGFloat, pct: Int, charging: Bool) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func drawBattery(_ ctx: CGContext, x: CGFloat, y: CGFloat, pct: Int, charging: Bool) {
         let clamped = max(0, min(100, pct))
         ctx.saveGState()
         let outline = UIBezierPath(roundedRect: CGRect(x: x, y: y, width: 24, height: 12), cornerRadius: 3)
@@ -833,11 +846,11 @@ public enum G2StudioGraphics {
         ctx.fill(CGRect(x: x + 25.5, y: y + 3.5, width: 2, height: 5))
         ctx.restoreGState()
 
-        fillRoundedRect(rawCtx, x: x + 2.4, y: y + 2.4, w: max(1, 19.0 * CGFloat(clamped) / 100.0), h: 7.2, r: 1.4, level: 14)
-        drawText(rawCtx, "\(charging ? "+" : "")\(clamped)%", x: x + 33, y: y + 6.5, font: .monospacedSystemFont(ofSize: 12, weight: .medium), level: 11, align: .left, baseline: .middle)
+        fillRoundedRect(ctx, x: x + 2.4, y: y + 2.4, w: max(1, 19.0 * CGFloat(clamped) / 100.0), h: 7.2, r: 1.4, level: 14)
+        drawText(ctx, "\(charging ? "+" : "")\(clamped)%", x: x + 33, y: y + 6.5, font: .monospacedSystemFont(ofSize: 12, weight: .medium), level: 11, align: .left, baseline: .middle)
     }
 
-    private static func drawGlyph(_ ctx: Any, kind: String, cx: CGFloat, cy: CGFloat, size: CGFloat, level: Int) {
+    private static func drawGlyph(_ ctx: CGContext, kind: String, cx: CGFloat, cy: CGFloat, size: CGFloat, level: Int) {
         switch kind {
         case "kakao": drawKakaoIcon(ctx, cx: cx, cy: cy, size: size, level: level)
         case "agy":   drawAgyIcon(ctx, cx: cx, cy: cy, size: size, level: level)
@@ -846,8 +859,7 @@ public enum G2StudioGraphics {
         }
     }
 
-    private static func drawCompassIcon(_ rawCtx: Any, cx: CGFloat, cy: CGFloat, size: CGFloat, level: Int) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func drawCompassIcon(_ ctx: CGContext, cx: CGFloat, cy: CGFloat, size: CGFloat, level: Int) {
         let r = size / 2.0
         ctx.saveGState()
         ctx.setStrokeColor(gray: gVal(level), alpha: 1.0)
@@ -864,8 +876,7 @@ public enum G2StudioGraphics {
         ctx.restoreGState()
     }
 
-    private static func drawAgyIcon(_ rawCtx: Any, cx: CGFloat, cy: CGFloat, size: CGFloat, level: Int) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func drawAgyIcon(_ ctx: CGContext, cx: CGFloat, cy: CGFloat, size: CGFloat, level: Int) {
         let r = size / 2.0
         ctx.saveGState()
         ctx.setFillColor(gray: gVal(level), alpha: 1.0)
@@ -879,8 +890,7 @@ public enum G2StudioGraphics {
         ctx.restoreGState()
     }
 
-    private static func drawKakaoIcon(_ rawCtx: Any, cx: CGFloat, cy: CGFloat, size: CGFloat, level: Int) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func drawKakaoIcon(_ ctx: CGContext, cx: CGFloat, cy: CGFloat, size: CGFloat, level: Int) {
         let r = size / 2.0
         ctx.saveGState()
         ctx.setStrokeColor(gray: gVal(level), alpha: 1.0)
@@ -898,8 +908,7 @@ public enum G2StudioGraphics {
         ctx.restoreGState()
     }
 
-    private static func drawBellIcon(_ rawCtx: Any, cx: CGFloat, cy: CGFloat, size: CGFloat, level: Int) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func drawBellIcon(_ ctx: CGContext, cx: CGFloat, cy: CGFloat, size: CGFloat, level: Int) {
         let r = size / 2.0
         ctx.saveGState()
         ctx.setStrokeColor(gray: gVal(level), alpha: 1.0)
@@ -916,8 +925,7 @@ public enum G2StudioGraphics {
         ctx.restoreGState()
     }
 
-    private static func drawWeatherGlyph(_ rawCtx: Any, code: String, cx: CGFloat, cy: CGFloat, size: CGFloat, level: Int) {
-        guard let ctx = rawCtx as? CGContext else { return }
+    private static func drawWeatherGlyph(_ ctx: CGContext, code: String, cx: CGFloat, cy: CGFloat, size: CGFloat, level: Int) {
         let r = size / 2.0
         ctx.saveGState()
         ctx.setStrokeColor(gray: gVal(level), alpha: 1.0)
