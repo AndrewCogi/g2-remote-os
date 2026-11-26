@@ -26,38 +26,44 @@ public enum G2Frame {
         }
     }
 
-    /// Wraps a protobuf payload in one or more AA 21 frames with trailing little-endian CRC-16.
+    /// Wraps a protobuf payload in one or more AA 21 frames with a single trailing little-endian CRC-16
+    /// placed on the final packet only (byte-exact with official Even App BTSnoop multi-packet framing).
     /// Every fragment of one logical message shares the same `seq` byte.
     public static func framePb(
         _ pb: Data,
         sid: UInt8,
         flag: UInt8,
         seq: UInt8,
-        maxWrite: Int = 240
+        maxWrite: Int = 244
     ) -> [Data] {
-        let size = max(16, min(maxWrite - 8, defaultChunkSize))
-        var body = pb
-        body.append(CRC16.ccittFalseBytes(pb))
+        // Reserve 8 bytes AA header + 2 bytes trailing CRC on the final packet so no packet exceeds maxWrite.
+        let maxChunk = max(16, min(maxWrite - 10, defaultChunkSize))
+        let crc = CRC16.ccittFalseBytes(pb)
 
-        let total = max(1, (body.count + size - 1) / size)
+        let total = max(1, (pb.count + maxChunk - 1) / maxChunk)
         var frames: [Data] = []
         frames.reserveCapacity(total)
 
         for i in 0..<total {
-            let start = i * size
-            let end = min(start + size, body.count)
-            let chunk = body[start..<end]
+            let start = i * maxChunk
+            let end = min(start + maxChunk, pb.count)
+            let chunk = pb[start..<end]
+            let isFinal = (i == total - 1)
+            let lenByte = chunk.count + (isFinal ? 2 : 0)
 
-            var pkt = Data(capacity: 8 + chunk.count)
+            var pkt = Data(capacity: 8 + lenByte)
             pkt.append(headByte)
             pkt.append(dirAppToGlasses)
             pkt.append(seq)
-            pkt.append(UInt8(chunk.count & 0xFF))
+            pkt.append(UInt8(lenByte & 0xFF))
             pkt.append(UInt8(total & 0xFF))
             pkt.append(UInt8((i + 1) & 0xFF))
             pkt.append(sid)
             pkt.append(flag)
             pkt.append(chunk)
+            if isFinal {
+                pkt.append(crc)
+            }
             frames.append(pkt)
         }
         return frames

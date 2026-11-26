@@ -148,7 +148,8 @@ public enum G2Commands {
     public static let maxContainerNameBytes = 14
     public static let maxCreateTextBytes = 998
     public static let maxUpgradeTextBytes = 1998
-    public static let imageFragmentBytes = 200
+    /// Official Even App BTSnoop app-level BMP chunk size (4096 B -> ~18 AA packets per chunk, ~5x faster than 200 B).
+    public static let imageFragmentBytes = 4096
     public static let timeoutNever = 65365
 
     // MARK: - EvenHub (SID 0xE0) & Prelude (SID 0x01)
@@ -326,7 +327,7 @@ public enum G2Commands {
         return wrapEvenHub(cmd: 7, magic: magic, innerField: 7, inner: inner.build())
     }
 
-    /// SID 0xE0 cmd 3: Upload one 200-byte fragment of a 4-bit BMP image into an image container.
+    /// SID 0xE0 cmd 3: Upload one <=4096-byte chunk of a 4-bit BMP image into an image container.
     public static func buildImageRawData(
         magic: Int,
         containerId: Int,
@@ -343,43 +344,54 @@ public enum G2Commands {
             .string(2, safeName)
             .varint(3, mapSessionId)
             .varint(4, totalSize)
-            .varint(5, compressMode)
+        if compressMode != 0 {
+            inner.varint(5, compressMode)
+        }
+        inner
             .varint(6, fragmentIndex)
             .varint(7, fragmentData.count)
             .bytes(8, fragmentData)
-            .build()
-        return wrapEvenHub(cmd: 3, magic: magic, innerField: 5, inner: inner)
+        return wrapEvenHub(cmd: 3, magic: magic, innerField: 5, inner: inner.build())
     }
 
-    /// Splits a G2ImageContainer's 4-bit BMP into sequential 200-byte `cmd 3` protobuf payloads.
-    public static func buildImageUploadMessages(
+    /// Splits a G2ImageContainer's 4-bit BMP into sequential <=4096-byte `cmd 3` protobuf payloads paired with their `msgId`.
+    public static func buildImageUploadChunks(
         image: G2ImageContainer,
         mapSessionId: Int = 1,
         nextMagic: () -> Int
-    ) -> [Data] {
+    ) -> [(magic: Int, payload: Data)] {
         let bmp = G2PixelCanvas.encodeBmp4bpp(packed: image.packed4bpp, width: image.width, height: image.height)
         guard !bmp.isEmpty else { return [] }
-        var out: [Data] = []
+        var out: [(magic: Int, payload: Data)] = []
         var offset = 0
         var fragIdx = 0
         while offset < bmp.count {
             let end = min(bmp.count, offset + imageFragmentBytes)
             let chunk = Data(bmp[offset..<end])
-            out.append(
-                buildImageRawData(
-                    magic: nextMagic(),
-                    containerId: image.id,
-                    name: image.name,
-                    totalSize: bmp.count,
-                    fragmentIndex: fragIdx,
-                    fragmentData: chunk,
-                    mapSessionId: mapSessionId
-                )
+            let magic = nextMagic()
+            let pb = buildImageRawData(
+                magic: magic,
+                containerId: image.id,
+                name: image.name,
+                totalSize: bmp.count,
+                fragmentIndex: fragIdx,
+                fragmentData: chunk,
+                mapSessionId: mapSessionId
             )
+            out.append((magic: magic, payload: pb))
             offset = end
             fragIdx += 1
         }
         return out
+    }
+
+    /// Convenience wrapper returning only protobuf payloads.
+    public static func buildImageUploadMessages(
+        image: G2ImageContainer,
+        mapSessionId: Int = 1,
+        nextMagic: () -> Int
+    ) -> [Data] {
+        buildImageUploadChunks(image: image, mapSessionId: mapSessionId, nextMagic: nextMagic).map(\.payload)
     }
 
     /// SID 0xE0 cmd 5: Replace text inside an existing text container. LIVE-CONFIRMED.

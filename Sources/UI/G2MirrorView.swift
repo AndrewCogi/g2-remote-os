@@ -134,13 +134,13 @@ private struct G2CanvasPreview: View {
                             Text(tc.text)
                                 .font(.system(size: fontSize, weight: isFocusedCard ? .semibold : .medium))
                                 .foregroundColor(Color(red: 0.26, green: 1.0, blue: 0.48).opacity(isFocusedCard ? 1.0 : 0.84))
-                                .lineSpacing(2.5)
+                                .lineSpacing(2.2)
                                 .padding(.horizontal, CGFloat(tc.padding) * sx)
                                 .padding(.vertical, CGFloat(max(2, tc.padding - 2)) * sy)
                                 .frame(
                                     width: CGFloat(tc.width) * sx,
                                     height: CGFloat(tc.height) * sy,
-                                    alignment: .topLeading
+                                    alignment: tc.height <= 56 ? .leading : .topLeading
                                 )
                                 .clipped()
 

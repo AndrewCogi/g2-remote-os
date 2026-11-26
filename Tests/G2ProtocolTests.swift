@@ -112,39 +112,43 @@ final class G2ProtocolTests: XCTestCase {
         os.onToggleMic = { micEvents.append($0) }
         os.onSetScreenAsleep = { if $0 { sleepCalled = true } }
 
-        // 1. Starts on 100% pixel-identical 4-tile Studio Minimalist Home (1 invisible event container + 4 288x144 tiles)
+        // 1. Starts on Ultra-Fast Hybrid Minimalist Home (78pt clock + status icon + instant rounded peek pill)
         XCTAssertEqual(os.currentScreen, .dashboard)
-        XCTAssertEqual(os.currentPage.layoutKey, "studio_4tile_v1")
-        XCTAssertEqual(os.currentPage.textContainers.count, 1)
-        XCTAssertEqual(os.currentPage.imageContainers.count, 4)
+        XCTAssertEqual(os.currentPage.layoutKey, "studio_home")
+        XCTAssertEqual(os.currentPage.imageContainers.count, 2)
         XCTAssertEqual(os.currentPage.textContainers.filter(\.captureEvents).count, 1)
+
+        // Verify official 4096 B chunking keeps the 240x120 clock under 5 BLE chunks (vs 75+ previously!)
+        let clockChunks = G2Commands.buildImageUploadChunks(image: os.currentPage.imageContainers[0], mapSessionId: 1) { 1 }
+        XCTAssertLessThanOrEqual(clockChunks.count, 4)
 
         // 2. Back on Home NEVER sleeps or exits to stock OS
         os.handle(RemoteCommandEvent(action: .back, source: .zero2))
         XCTAssertEqual(os.currentScreen, .dashboard)
         XCTAssertFalse(sleepCalled)
 
-        // 3. Home ↓ opens Alerts Stack; ← dismisses 1 alert; ↑ at top returns to Home
+        // 3. Home ↓ opens Alerts Stack (0 images -> ~60ms native rounded focus cards); ← dismisses 1 alert; ↑ returns to Home
         let initialAlerts = os.alerts.count
         XCTAssertGreaterThan(initialAlerts, 0)
         os.handle(RemoteCommandEvent(action: .down, source: .zero2))
         XCTAssertEqual(os.currentScreen, .alerts)
+        XCTAssertEqual(os.currentPage.imageContainers.count, 0)
         os.handle(RemoteCommandEvent(action: .left, source: .zero2))
         XCTAssertEqual(os.alerts.count, initialAlerts - 1)
         os.handle(RemoteCommandEvent(action: .up, source: .zero2))
         XCTAssertEqual(os.currentScreen, .dashboard)
 
-        // 4. Home → opens 8-slot Menu Preview (Dock focused = -1); ↑ enters/exits Quick Preview (↓ stays on Dock)
+        // 4. Home → opens 8-slot Menu Preview (Dock focused = -1); ↑ enters/exits Quick Preview with fixed layoutKey (0ms dock re-upload!)
         os.handle(RemoteCommandEvent(action: .right, source: .zero2))
         XCTAssertEqual(os.currentScreen, .launcher)
         XCTAssertEqual(os.menuFocus, -1)
-        XCTAssertEqual(os.currentPage.layoutKey, "studio_4tile_v1")
-        XCTAssertEqual(os.currentPage.textContainers.count, 1)
-        XCTAssertEqual(os.currentPage.imageContainers.count, 4)
+        XCTAssertEqual(os.currentPage.layoutKey, "studio_menu_feed")
+        XCTAssertEqual(os.currentPage.imageContainers.count, 3) // status + dockL + dockR
         os.handle(RemoteCommandEvent(action: .down, source: .zero2))
         XCTAssertEqual(os.menuFocus, -1) // ↓ must NOT enter quick preview from dock
         os.handle(RemoteCommandEvent(action: .up, source: .zero2))
         XCTAssertEqual(os.menuFocus, 0)  // ↑ enters quick preview article #1
+        XCTAssertEqual(os.currentPage.layoutKey, "studio_menu_feed") // No cmd 7 rebuild!
         os.handle(RemoteCommandEvent(action: .down, source: .zero2))
         XCTAssertEqual(os.menuFocus, 1)  // ↓ moves to article #2
         os.handle(RemoteCommandEvent(action: .up, source: .zero2))
@@ -152,13 +156,15 @@ final class G2ProtocolTests: XCTestCase {
         os.handle(RemoteCommandEvent(action: .up, source: .zero2))
         XCTAssertEqual(os.menuFocus, -1) // ↑ at article #1 exits back to dock
 
-        // 5. L2 on Dock opens Full-Screen Feed; → switches category; L2 opens Reader; R2 returns
+        // 5. L2 on Dock opens Full-Screen Feed (0 images -> ~60ms); → switches category; L2 opens Reader; R2 returns
         os.handle(RemoteCommandEvent(action: .select, source: .zero2))
         XCTAssertEqual(os.currentScreen, .feedApp)
+        XCTAssertEqual(os.currentPage.imageContainers.count, 0)
         os.handle(RemoteCommandEvent(action: .right, source: .zero2))
         XCTAssertEqual(os.feedCatIdx, 1)
         os.handle(RemoteCommandEvent(action: .select, source: .zero2))
         XCTAssertEqual(os.currentScreen, .readerDetail)
+        XCTAssertEqual(os.currentPage.imageContainers.count, 0)
         os.handle(RemoteCommandEvent(action: .back, source: .zero2))
         XCTAssertEqual(os.currentScreen, .feedApp)
         os.handle(RemoteCommandEvent(action: .back, source: .zero2))
@@ -176,10 +182,10 @@ final class G2ProtocolTests: XCTestCase {
         XCTAssertFalse(os.isHeadUpDimmed)
         XCTAssertEqual(os.currentScreen, .dashboard)
 
-        // 7. Tailscale & Spark connected state updates top-right tile cleanly
+        // 7. Tailscale & Spark connected state updates status icon cleanly
         os.tailscaleConnected = true
         os.handleSparkEvent(.connected(host: "spark01", latencyMs: 18, sttModel: "large-v3-turbo"))
-        XCTAssertEqual(os.currentPage.imageContainers.count, 4)
+        XCTAssertEqual(os.currentPage.imageContainers.count, 2)
         XCTAssertTrue(os.sparkConnected)
 
         // 8. Global Push-to-Talk -> Even AI streaming flow

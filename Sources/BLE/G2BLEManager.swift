@@ -107,15 +107,20 @@ public final class G2BLEManager: NSObject, ObservableObject {
     private var keepaliveTimer: DispatchSourceTimer?
     private var handshakeStarted = false
 
-    // Serialized write pipeline (ensures multi-fragment writes never interleave with heartbeats)
-    private struct WriteTask {
+    // Serialized message-atomic write pipeline with ACK-gated 4KB image chunking & text priority.
+    // Never interleaves fragments of one multi-packet AA message with another message or heartbeat.
+    private struct WriteMessage {
         let side: G2Constants.LensSide
-        let data: Data
+        var packets: [Data]
+        let ackMagic: Int?
         let imageContainerId: Int?
     }
-    private var writeQueue: [WriteTask] = []
+    private var messageQueue: [WriteMessage] = []
+    private var activeMessage: WriteMessage?
     private var isDrainingWrites = false
     private var waitingForWriteReady = false
+    private var waitingAckMagic: Int?
+    private var ackTimeoutWorkItem: DispatchWorkItem?
     private var pendingPageRenderWorkItem: DispatchWorkItem?
 
     // Saved lens UUIDs for instant auto-reconnect
@@ -264,9 +269,13 @@ public final class G2BLEManager: NSObject, ObservableObject {
             self.micEnabledLocked = false
             self.imuActiveLocked = false
             self.screenAsleepLocked = false
-            self.writeQueue.removeAll()
+            self.messageQueue.removeAll()
+            self.activeMessage = nil
             self.isDrainingWrites = false
             self.waitingForWriteReady = false
+            self.waitingAckMagic = nil
+            self.ackTimeoutWorkItem?.cancel()
+            self.ackTimeoutWorkItem = nil
 
             if let lp = self.leftPeripheral { self.central.cancelPeripheralConnection(lp) }
             if let rp = self.rightPeripheral { self.central.cancelPeripheralConnection(rp) }
@@ -302,31 +311,13 @@ public final class G2BLEManager: NSObject, ObservableObject {
     // MARK: - Multi-Container & 4-bit Image Display Rendering
 
     /// Renders a multi-container G2PageSpec onto the 576x288 EvenHub canvas.
-    /// Uses fast differential `cmd 5` text upgrades, per-tile FNV-1a dirty-tile `cmd 3` BMP uploads,
-    /// stale-frame cancellation, and 60ms burst coalescing so rapid D-Pad/swipe navigation never queues stale frames.
+    /// Text-only updates & layout switches fire immediately (~60-85ms), while image chunks use
+    /// official 4096 B ACK-gated streaming with per-container FNV-1a dirty diffing.
     public func renderPage(_ page: G2PageSpec) {
         bleQueue.async { [weak self] in
             guard let self else { return }
             self.lastRenderedPage = page
             guard self.sessionReady else { return }
-
-            let hasImageBacklog = self.writeQueue.contains { $0.imageContainerId != nil }
-            if hasImageBacklog && self.activeLayoutKey == page.layoutKey {
-                // Drop unsent stale tile fragments AND invalidate their hashes so interrupted tiles always re-upload cleanly
-                let purgedIds = Set(self.writeQueue.compactMap(\.imageContainerId))
-                for id in purgedIds { self.uploadedImageHashes.removeValue(forKey: id) }
-                self.writeQueue.removeAll { $0.imageContainerId != nil }
-                self.pendingPageRenderWorkItem?.cancel()
-                let work = DispatchWorkItem { [weak self] in
-                    guard let self, self.sessionReady else { return }
-                    self.pendingPageRenderWorkItem = nil
-                    self.applyRenderedPageLocked(self.lastRenderedPage)
-                }
-                self.pendingPageRenderWorkItem = work
-                self.bleQueue.asyncAfter(deadline: .now() + 0.060, execute: work)
-                return
-            }
-
             self.pendingPageRenderWorkItem?.cancel()
             self.pendingPageRenderWorkItem = nil
             self.applyRenderedPageLocked(page)
@@ -343,9 +334,11 @@ public final class G2BLEManager: NSObject, ObservableObject {
         }
 
         if self.activeLayoutKey != page.layoutKey {
-            self.writeQueue.removeAll { $0.imageContainerId != nil }
-            let rebuildPb = G2Commands.buildRebuildPage(magic: self.nextMagic(), page: page)
-            self.enqueueProtobuf(rebuildPb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+            // Cancel any pending image chunks from the previous layout immediately
+            self.purgeQueuedImagesLocked(containerIds: nil)
+            let magic = self.nextMagic()
+            let rebuildPb = G2Commands.buildRebuildPage(magic: magic, page: page)
+            self.enqueueProtobuf(rebuildPb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right, highPriority: true)
             self.activeLayoutKey = page.layoutKey
             self.lastPushedTexts = Dictionary(uniqueKeysWithValues: page.textContainers.map { ($0.id, $0.text) })
             self.uploadedImageHashes.removeAll()
@@ -353,16 +346,17 @@ public final class G2BLEManager: NSObject, ObservableObject {
             return
         }
 
-        // Same layout -> push only text/image diffs
+        // Same layout -> push text diffs IMMEDIATELY ahead of any background image chunks (~62ms!)
         for tc in page.textContainers {
             if self.lastPushedTexts[tc.id] != tc.text {
+                let magic = self.nextMagic()
                 let upgradePb = G2Commands.buildTextUpgrade(
-                    magic: self.nextMagic(),
+                    magic: magic,
                     containerId: tc.id,
                     containerName: tc.name,
                     text: tc.text
                 )
-                self.enqueueProtobuf(upgradePb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+                self.enqueueProtobuf(upgradePb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right, highPriority: true)
                 self.lastPushedTexts[tc.id] = tc.text
             }
         }
@@ -380,20 +374,45 @@ public final class G2BLEManager: NSObject, ObservableObject {
         renderPage(single)
     }
 
+    private func purgeQueuedImagesLocked(containerIds: Set<Int>?) {
+        let purged: Set<Int>
+        if let ids = containerIds {
+            purged = ids
+            messageQueue.removeAll { msg in
+                guard let cid = msg.imageContainerId else { return false }
+                return ids.contains(cid)
+            }
+        } else {
+            purged = Set(messageQueue.compactMap(\.imageContainerId))
+            messageQueue.removeAll { $0.imageContainerId != nil }
+        }
+        for id in purged {
+            uploadedImageHashes.removeValue(forKey: id)
+        }
+    }
+
     private func enqueueImageUploadsLocked(_ images: [G2ImageContainer]) {
         for img in images {
             guard uploadedImageHashes[img.id] != img.contentHash else { continue }
-            // Cancel any remaining stale fragments for this tile before sending the updated bitmap
-            writeQueue.removeAll { $0.imageContainerId == img.id }
+            // Drop any unsent older chunks for this same image container before queueing the new bitmap
+            purgeQueuedImagesLocked(containerIds: [img.id])
             uploadedImageHashes[img.id] = img.contentHash
             imageMapSessionId = (imageMapSessionId % 250) + 1
-            let payloads = G2Commands.buildImageUploadMessages(
+            let chunks = G2Commands.buildImageUploadChunks(
                 image: img,
                 mapSessionId: imageMapSessionId,
                 nextMagic: { self.nextMagic() }
             )
-            for pb in payloads {
-                enqueueProtobuf(pb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right, imageContainerId: img.id)
+            for chunk in chunks {
+                enqueueProtobuf(
+                    chunk.payload,
+                    sid: G2SID.evenHub,
+                    flag: G2Frame.flagRequest,
+                    side: .right,
+                    ackMagic: chunk.magic,
+                    imageContainerId: img.id,
+                    highPriority: false
+                )
             }
         }
     }
@@ -701,9 +720,10 @@ public final class G2BLEManager: NSObject, ObservableObject {
         screenAsleepLocked = false
         DispatchQueue.main.async { self.isScreenAsleep = false }
 
-        enqueue(side: .right, data: G2Commands.preludeFrame)
+        purgeQueuedImagesLocked(containerIds: nil)
+        enqueue(side: .right, data: G2Commands.preludeFrame, highPriority: true)
         let createPb = G2Commands.buildCreatePage(magic: nextMagic(), page: lastRenderedPage)
-        enqueueProtobuf(createPb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+        enqueueProtobuf(createPb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right, highPriority: true)
 
         activeLayoutKey = lastRenderedPage.layoutKey
         lastPushedTexts = Dictionary(uniqueKeysWithValues: lastRenderedPage.textContainers.map { ($0.id, $0.text) })
@@ -758,7 +778,7 @@ public final class G2BLEManager: NSObject, ObservableObject {
 
             self.lastHeartbeatSentAt = now
             let hb = G2Commands.buildHeartbeat(magic: self.nextMagic())
-            self.enqueueProtobuf(hb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right)
+            self.enqueueProtobuf(hb, sid: G2SID.evenHub, flag: G2Frame.flagRequest, side: .right, highPriority: true)
         }
         timer.resume()
         heartbeatTimer = timer
@@ -790,42 +810,76 @@ public final class G2BLEManager: NSObject, ObservableObject {
         keepaliveTimer = nil
     }
 
-    // MARK: - Serialized High-Speed Flow-Controlled BLE Write Queue
+    // MARK: - Serialized ACK-Gated High-Speed Flow-Controlled BLE Write Queue
 
-    private func enqueueProtobuf(_ pb: Data, sid: UInt8, flag: UInt8, side: G2Constants.LensSide, imageContainerId: Int? = nil) {
+    private func enqueueProtobuf(
+        _ pb: Data,
+        sid: UInt8,
+        flag: UInt8,
+        side: G2Constants.LensSide,
+        ackMagic: Int? = nil,
+        imageContainerId: Int? = nil,
+        highPriority: Bool = false
+    ) {
         let maxWrite: Int
         if let p = (side == .right ? rightPeripheral : leftPeripheral) {
-            maxWrite = min(240, max(20, p.maximumWriteValueLength(for: .withoutResponse)))
+            maxWrite = min(244, max(20, p.maximumWriteValueLength(for: .withoutResponse)))
         } else {
-            maxWrite = 240
+            maxWrite = 244
         }
         let frames = G2Frame.framePb(pb, sid: sid, flag: flag, seq: nextSeq(), maxWrite: maxWrite)
-        for frame in frames {
-            writeQueue.append(WriteTask(side: side, data: frame, imageContainerId: imageContainerId))
+        let msg = WriteMessage(side: side, packets: frames, ackMagic: ackMagic, imageContainerId: imageContainerId)
+        enqueueMessageLocked(msg, highPriority: highPriority)
+    }
+
+    private func enqueue(side: G2Constants.LensSide, data: Data, highPriority: Bool = false) {
+        let msg = WriteMessage(side: side, packets: [data], ackMagic: nil, imageContainerId: nil)
+        enqueueMessageLocked(msg, highPriority: highPriority)
+    }
+
+    private func enqueueMessageLocked(_ msg: WriteMessage, highPriority: Bool) {
+        if highPriority, let firstImgIdx = messageQueue.firstIndex(where: { $0.imageContainerId != nil }) {
+            // Slip fast text upgrades, rebuilds, and heartbeats ahead of queued 4KB image chunks
+            messageQueue.insert(msg, at: firstImgIdx)
+        } else {
+            messageQueue.append(msg)
         }
         drainWriteQueue()
     }
 
-    private func enqueue(side: G2Constants.LensSide, data: Data, imageContainerId: Int? = nil) {
-        writeQueue.append(WriteTask(side: side, data: data, imageContainerId: imageContainerId))
-        drainWriteQueue()
+    private func handleEvenHubAckLocked(magic: Int) {
+        guard let waiting = waitingAckMagic, waiting == magic else { return }
+        waitingAckMagic = nil
+        ackTimeoutWorkItem?.cancel()
+        ackTimeoutWorkItem = nil
+        // Official BTSnoop §9: minimum 10ms breathing gap after chunk ACK before next 4KB burst
+        bleQueue.asyncAfter(deadline: .now() + 0.010) { [weak self] in
+            guard let self else { return }
+            self.isDrainingWrites = false
+            self.drainWriteQueue()
+        }
     }
 
     private func drainWriteQueue() {
-        guard !isDrainingWrites else { return }
-        guard let next = writeQueue.first else {
-            waitingForWriteReady = false
-            return
+        guard !isDrainingWrites, waitingAckMagic == nil else { return }
+
+        if activeMessage == nil || activeMessage?.packets.isEmpty == true {
+            guard !messageQueue.isEmpty else {
+                activeMessage = nil
+                waitingForWriteReady = false
+                return
+            }
+            activeMessage = messageQueue.removeFirst()
         }
 
-        let peripheral = (next.side == .right) ? rightPeripheral : leftPeripheral
-        let char = (next.side == .right) ? rightWriteChar : leftWriteChar
+        guard let current = activeMessage, !current.packets.isEmpty else { return }
+        let peripheral = (current.side == .right) ? rightPeripheral : leftPeripheral
+        let char = (current.side == .right) ? rightWriteChar : leftWriteChar
 
         if let peripheral, char != nil, peripheral.state == .connected, !peripheral.canSendWriteWithoutResponse {
             if !waitingForWriteReady {
                 waitingForWriteReady = true
-                // Safety fallback timer in case iOS delays peripheralIsReady callback
-                bleQueue.asyncAfter(deadline: .now() + 0.080) { [weak self] in
+                bleQueue.asyncAfter(deadline: .now() + 0.060) { [weak self] in
                     guard let self, self.waitingForWriteReady else { return }
                     self.waitingForWriteReady = false
                     self.drainWriteQueue()
@@ -836,14 +890,32 @@ public final class G2BLEManager: NSObject, ObservableObject {
 
         waitingForWriteReady = false
         isDrainingWrites = true
-        let task = writeQueue.removeFirst()
+        var updated = current
+        let packet = updated.packets.removeFirst()
+        let isLastPacketOfMessage = updated.packets.isEmpty
+        activeMessage = isLastPacketOfMessage ? nil : updated
 
         if let peripheral, let char, peripheral.state == .connected {
-            peripheral.writeValue(task.data, for: char, type: .withoutResponse)
+            peripheral.writeValue(packet, for: char, type: .withoutResponse)
         }
 
-        // 9ms pacing for image tiles (~110 pkt/s with flow control = ~3x faster), 18ms for control commands
-        let delay: TimeInterval = (task.imageContainerId != nil) ? 0.009 : 0.018
+        // If this was the final AA packet of an ACK-gated 4KB image chunk, wait for e0-00 ACK (median ~176ms, fallback 360ms).
+        if isLastPacketOfMessage, let expectedAck = updated.ackMagic {
+            waitingAckMagic = expectedAck
+            ackTimeoutWorkItem?.cancel()
+            let fallback = DispatchWorkItem { [weak self] in
+                guard let self, self.waitingAckMagic == expectedAck else { return }
+                self.waitingAckMagic = nil
+                self.isDrainingWrites = false
+                self.drainWriteQueue()
+            }
+            ackTimeoutWorkItem = fallback
+            bleQueue.asyncAfter(deadline: .now() + 0.360, execute: fallback)
+            return
+        }
+
+        // Fast 4ms intra-chunk burst (packs multiple AA packets per BLE connection interval), 16ms between control messages.
+        let delay: TimeInterval = isLastPacketOfMessage ? 0.016 : 0.004
         bleQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.isDrainingWrites = false
@@ -1011,6 +1083,13 @@ extension G2BLEManager: CBCentralManagerDelegate {
         imuActiveLocked = false
         handshakeStarted = false
         micEnabledLocked = false
+        messageQueue.removeAll()
+        activeMessage = nil
+        isDrainingWrites = false
+        waitingForWriteReady = false
+        waitingAckMagic = nil
+        ackTimeoutWorkItem?.cancel()
+        ackTimeoutWorkItem = nil
 
         emitLog("[G2] \(lensSide.displayName) 연결 끊김 (\(error?.localizedDescription ?? "링크 해제"))")
 
@@ -1105,6 +1184,9 @@ extension G2BLEManager: CBPeripheralDelegate {
 
         switch frame.sid {
         case G2SID.evenHub:
+            if frame.flag == 0x00, let ackMagic = G2Frame.readAckMagic(frame.payload) {
+                self.handleEvenHubAckLocked(magic: ackMagic)
+            }
             if let event = G2Commands.decodeDeviceEvent(frame.payload) {
                 if event.eventType == .imuData, let imu = event.imu {
                     DispatchQueue.main.async { self.onImuSample?(imu) }
